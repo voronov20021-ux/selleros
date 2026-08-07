@@ -1,0 +1,2 @@
+class WBRateLimitError(Exception):
+    pass
