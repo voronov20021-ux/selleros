@@ -1,6 +1,28 @@
 import html
+import re
 
+from backend.ai.recommendations import Recommendation, RecommendationType
 from backend.config import AI_NAME
+from backend.wb.provenance import field_provenance_label
+
+_MAX_MARKET_RECS = 5          # максимум рекомендаций в блоке
+_MIN_SHOW_CONF   = 0.50       # показываем только confidence >= порога
+
+# Понятные пользователю источники вместо технического UUID
+_SOURCE_NAMES = {
+    "yandex_wordstat": "Яндекс Wordstat",
+    "yandex_search":   "Яндекс Поиск",
+    "manual":          "Данные команды",
+    "seller":          "Данные продавца",
+}
+_TYPE_ICONS = {
+    RecommendationType.PRICE:       "💰",
+    RecommendationType.ADVERTISING: "📢",
+    RecommendationType.CONTENT:     "📝",
+    RecommendationType.STOCK:       "📦",
+    RecommendationType.MARKET:      "🌐",
+    RecommendationType.MONITOR:     "🔭",
+}
 
 # Эмодзи, с которых начинаются «плюсы» и «минусы» в reasons.
 _POSITIVE = ("✅", "👍", "⭐", "💬", "📋", "🔥")
@@ -16,7 +38,7 @@ _SOURCE_LABELS = {
 def _seller_line(label: str, value, unit: str, source: str | None) -> str:
     """Одна строка блока «Данные продавца»: значение + честный источник."""
     if value is None:
-        return f"• {label}: не указано"
+        return f"• {label}: нет данных"
 
     suffix = f" {unit}" if unit else ""
     source_label = _SOURCE_LABELS.get(source or "")
@@ -25,8 +47,43 @@ def _seller_line(label: str, value, unit: str, source: str | None) -> str:
     return f"• {label}: {value}{suffix}{source_part}"
 
 
-def verdict_for(score: int) -> str:
-    """Единый вердикт по Score — используется в карточке и истории."""
+def _card_commercial_line(product, label: str, field: str, unit: str = "") -> str:
+    """CARD DATA строка с provenance; None → «нет данных»."""
+    val = getattr(product, field, None)
+    if val is None:
+        return f"• {label}: нет данных"
+    suffix = f" {unit}" if unit else ""
+    prov = field_provenance_label(product, field)
+    if prov:
+        return f"• {label}: {val}{suffix}\n  Источник: {prov}"
+    return f"• {label}: {val}{suffix}"
+
+
+_GENERIC_CARD_REC_MARKERS = (
+    "заполните характеристик",
+    "добавьте подробное описание",
+    "сделайте описание более",
+    "добавьте больше фотографий",
+    "инфографик",
+)
+
+
+def _is_generic_card_recommendation(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _GENERIC_CARD_REC_MARKERS)
+
+
+def verdict_for(
+    score: int,
+    *,
+    diagnosis_kind: str | None = None,
+    funnel_complete: bool = False,
+) -> str:
+    """Вердикт по Score. При NO_SYSTEMIC не красим как «нужна оптимизация»."""
+    if (diagnosis_kind or "") == "no_systemic":
+        if not funnel_complete:
+            return "Полная оценка ограничена: нет CTR/CVR/заказов"
+        return "Системной проблемы не видно"
     if score >= 90:
         return "🟢 Отличная карточка"
     if score >= 75:
@@ -36,7 +93,164 @@ def verdict_for(score: int) -> str:
     return "🔴 Нужна оптимизация"
 
 
+def sanitize_no_systemic_comment(text: str) -> str:
+    """Убрать causal claims про продажи/доверие/фото-плюс из LLM-обёртки."""
+    if not text:
+        return text
+    s = text
+    s = re.sub(
+        r"системн\w* проблем\w*(?:\s+\w+){0,4}\s+с\s+продаж\w*\s+не\s+наблюда\w*",
+        "Системной проблемы по доступным данным пока не видно",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"[^.!?\n]*свидетельств\w*\s+о\s+высоком(?:\s+уровне)?\s+довери[^.!?\n]*[.!?]?",
+        "Рейтинг: факт карточки, не оценка доверия.",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"\d+\s*фотограф\w*\s*[—\-–]\s*плюс",
+        "фото: счётчик кадров; качество и соответствие не проверялись",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"⚠️?\s*низкий рейтинг\.?",
+        "Слабый сигнал: рейтинг при малой выборке — не системный вывод.",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"[^.!?\n]*выглядит\s+адекватн[^.!?\n]*[.!?]?",
+        "Рыночная позиция не определена — commercial fields конкурентов не подтверждены.",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"[^.!?\n]*негативно\s+сказыва[^.!?\n]*[.!?]?",
+        "Характеристики: можно проверить как IDEA/CHECK, влияние на продажи не доказано.",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"[^.!?\n]*\bесть\s+спрос\b[^.!?\n]*[.!?]?",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"[^.!?\n]*cvr\s*[\d.]+%\s*говорит о том[^.!?\n]*[.!?]?",
+        "CVR известен как observation; без baseline не утверждаю, что он низкий.",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"cvr\s*низк\w*",
+        "CVR без baseline не классифицирую",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r" {2,}", " ", s)
+    return s.strip()
+
+
+def _filter_score_reasons_display(
+    pluses: list[str],
+    minuses: list[str],
+    *,
+    product=None,
+    advisor_plan=None,
+) -> tuple[list[str], list[str]]:
+    """Display-only: score formula unchanged. Hide quality judgments without evidence."""
+    kind = ""
+    if advisor_plan is not None:
+        kind = str(getattr(advisor_plan, "main_problem_kind", "") or "")
+    n_fb = 0
+    if product is not None and getattr(product, "feedbacks", None) is not None:
+        try:
+            n_fb = int(getattr(product, "feedbacks"))
+        except (TypeError, ValueError):
+            n_fb = 0
+    photos_analyzed = bool(getattr(advisor_plan, "photos_analyzed", False)) if advisor_plan else False
+    if not photos_analyzed:
+        pluses = [
+            p for p in pluses
+            if not re.search(r"много фотографий|достаточно фотографий", p, re.I)
+        ]
+    if kind in ("no_systemic", "funnel_symptom"):
+        minuses = [
+            m for m in minuses
+            if "низкий рейтинг" not in m.lower() and "средний рейтинг" not in m.lower()
+        ]
+    return pluses, minuses
+
+
 class ReportBuilder:
+
+    # ──────────────────────────── market block ───────────────────────── #
+
+    @staticmethod
+    def build_market_block(market_recs: list[Recommendation]) -> str:
+        """
+        Компактный HTML-блок «🎯 Действия для роста» из market recommendations.
+
+        Показывает только рекомендации с confidence >= _MIN_SHOW_CONF (макс. 5).
+        MONITOR-рекомендации — отдельным разделом «👁 Наблюдения».
+        Не показывает технические UUID — только понятный тип/источник.
+        Возвращает пустую строку, если нечего показывать.
+        """
+        if not market_recs:
+            return ""
+
+        # Разделяем на конкретные действия и наблюдения
+        actions = [
+            r for r in market_recs
+            if r.type != RecommendationType.MONITOR
+            and r.confidence >= _MIN_SHOW_CONF
+        ][:_MAX_MARKET_RECS]
+
+        monitors = [
+            r for r in market_recs
+            if r.type == RecommendationType.MONITOR
+            and r.confidence >= _MIN_SHOW_CONF
+        ][:_MAX_MARKET_RECS]
+
+        # Если совсем пусто — не выводим блок
+        if not actions and not monitors:
+            return ""
+
+        lines: list[str] = []
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🎯 <b>Действия для роста</b>")
+
+        for idx, rec in enumerate(actions, 1):
+            icon = _TYPE_ICONS.get(rec.type, "•")
+            title = html.escape(rec.title)
+            reason = html.escape(rec.reason)
+            action = html.escape(rec.action)
+            conf_pct = int(rec.confidence * 100)
+            lines.append("")
+            lines.append(f"{idx}. {icon} <b>{title}</b>")
+            lines.append(f"   Почему: {reason}")
+            lines.append(f"   Действие: {action}")
+            lines.append(f"   Уверенность: {conf_pct}%")
+
+        if monitors:
+            lines.append("")
+            lines.append("👁 <b>Наблюдения</b>")
+            for rec in monitors:
+                icon = _TYPE_ICONS.get(rec.type, "🔭")
+                title = html.escape(rec.title)
+                action = html.escape(rec.action)
+                lines.append(f"• {title}: {action}")
+
+        return "\n".join(lines)
+
+    # ──────────────────────────── card build ─────────────────────────── #
 
     def build_card(
         self,
@@ -44,13 +258,15 @@ class ReportBuilder:
         score_data: dict,
         recommendations: list,
         ai_comment: str | None = None,
+        market_recs: list[Recommendation] | None = None,
+        advisor_plan=None,
     ) -> str:
         """
         Красивая карточка анализа для Telegram (parse_mode=HTML).
 
         Структура:
             шапка -> цена/рейтинг -> описание ->
-            плюсы -> минусы -> советы Seller AI -> итог
+            плюсы -> минусы -> советы Seller AI -> Advisor -> итог
         """
 
         score = score_data["score"]
@@ -58,6 +274,18 @@ class ReportBuilder:
 
         pluses = [r for r in reasons if r.startswith(_POSITIVE)]
         minuses = [r for r in reasons if r.startswith(_NEGATIVE)]
+        pluses, minuses = _filter_score_reasons_display(
+            pluses, minuses, product=product, advisor_plan=advisor_plan,
+        )
+
+        # Не дублировать шаблонные советы, если Advisor сказал «ничего не трогай»
+        leave_alone = False
+        if advisor_plan is not None:
+            do_first = (getattr(advisor_plan, "do_first", None) or "").lower()
+            leave_alone = "ничего не трогай" in do_first or "ничего критичного" in (
+                getattr(advisor_plan, "main_verdict", None) or ""
+            ).lower()
+        recs_to_show = [] if leave_alone else list(recommendations or [])
 
         lines = []
 
@@ -121,11 +349,21 @@ class ReportBuilder:
             lines.append("<b>Минусы</b>")
             lines.extend(minuses)
 
+        # Score breakdown (если есть) — без CTR
+        breakdown = score_data.get("breakdown") if isinstance(score_data, dict) else None
+        if breakdown and isinstance(breakdown, dict):
+            bits = [f"{k}:{v}" for k, v in breakdown.items()]
+            if bits:
+                lines.append("")
+                lines.append(
+                    "📊 Score breakdown (card_only): " + ", ".join(bits)
+                )
+
         # --- Советы Seller AI ---
-        if recommendations:
+        if recs_to_show:
             lines.append("")
             lines.append(f"<b>Советы {AI_NAME}</b>")
-            for recommendation in recommendations:
+            for recommendation in recs_to_show:
                 lines.append(f"• {recommendation}")
 
         # --- Живой комментарий Seller AI (если AI доступен) ---
@@ -134,11 +372,33 @@ class ReportBuilder:
             lines.append(f"<b>Разбор от {AI_NAME}</b>")
             lines.append(html.escape(ai_comment.strip()))
 
+        # --- Actionable Advisor ---
+        advisor_block = self.build_advisor_block(advisor_plan)
+        if advisor_block:
+            lines.append(advisor_block)
+
+        # --- Market Recommendations (Intelligence Layer) ---
+        if market_recs:
+            market_block = self.build_market_block(market_recs)
+            if market_block:
+                lines.append(market_block)
+
         # --- Итог ---
         lines.append("")
         lines.append(f"<b>{verdict_for(score)}.</b>")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def build_advisor_block(advisor_plan) -> str:
+        """HTML-блок Actionable Advisor; пусто если плана нет."""
+        if advisor_plan is None:
+            return ""
+        if hasattr(advisor_plan, "has_content") and not advisor_plan.has_content():
+            return ""
+        if hasattr(advisor_plan, "format_html"):
+            return advisor_plan.format_html() or ""
+        return ""
 
     def build_full_report(self, product, analysis: dict) -> str:
         """«📊 Полный отчёт» — все данные карточки одним экраном."""
@@ -230,26 +490,31 @@ class ReportBuilder:
 
         return "\n".join(parts)[:1000]
 
-    def build_preliminary(self, product, score_data: dict, recommendations: list) -> str:
+    def build_preliminary(
+        self,
+        product,
+        score_data: dict,
+        recommendations: list,
+        market_recs: list[Recommendation] | None = None,
+    ) -> str:
         """
-        «🤖 Предварительный анализ» — строится ТОЛЬКО по данным карточки
-        (контент): название, описание, характеристики, фото. Цена/рейтинг/
-        отзывы сюда не подставляются, даже если где-то есть — предварительный
-        анализ намеренно не претендует на оценку эффективности продаж.
+        «🤖 Предварительный анализ» — данные карточки WB (контент +
+        публичные price/rating/feedbacks, если уже получены).
 
-        Если price/rating/feedbacks отсутствуют — честно перечисляем это
-        как то, что нужно для точного анализа, вместо того чтобы молчать
-        или показывать 0.
+        SellerData сюда не подмешивается. Если публичные поля есть —
+        показываем их. Если нет — честно просим указать вручную.
         """
         score = score_data["score"]
         reasons = score_data["reasons"]
 
         pluses = [r for r in reasons if r.startswith(_POSITIVE)]
         minuses = [r for r in reasons if r.startswith(_NEGATIVE)]
+        pluses, minuses = _filter_score_reasons_display(
+            pluses, minuses, product=product, advisor_plan=None,
+        )
 
         # Совет про цену из RecommendationGenerator упоминает
-        # API/BrowserProvider — техническая формулировка, которая тут не
-        # нужна: ниже даём собственный явный блок про нехватку seller-данных.
+        # API/BrowserProvider — техническая формулировка; ниже свой блок.
         content_recommendations = [r for r in recommendations if not r.startswith("💰")]
 
         lines = []
@@ -264,10 +529,18 @@ class ReportBuilder:
         lines.append("🏷 " + " · ".join(meta))
         lines.append("")
 
-        lines.append("<b>Данные карточки</b>")
+        lines.append("<b>Данные карточки (CARD)</b>")
         lines.append(f"📝 Описание: {'есть' if product.description else 'нет'}")
         lines.append(f"🖼 Фото: {len(product.photos)}")
         lines.append(f"⚙️ Характеристики: {len(product.characteristics)}")
+        if product.price is not None:
+            lines.append(_card_commercial_line(product, "Публичная цена", "price", "₽").lstrip("• "))
+        if product.rating is not None:
+            lines.append(_card_commercial_line(product, "Рейтинг", "rating").lstrip("• "))
+        if product.feedbacks is not None:
+            lines.append(
+                _card_commercial_line(product, "Отзывов на карточке", "feedbacks").lstrip("• ")
+            )
 
         lines.append("")
         lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -296,14 +569,30 @@ class ReportBuilder:
         if product.rating is None:
             missing.append("• средняя оценка")
         if product.feedbacks is None:
-            missing.append("• количество отзывов")
+            missing.append("• количество отзывов на карточке")
 
         if missing:
             lines.append("")
-            lines.append("⚠️ <b>Для точного анализа не хватает данных продавца:</b>")
+            lines.append(
+                "⚠️ <b>Публичная карточка не отдала:</b>"
+            )
             lines.extend(missing)
             lines.append("")
-            lines.append("Нажмите «📊 Точный анализ», чтобы указать их.")
+            lines.append(
+                "Нажмите «📊 Точный анализ», чтобы указать недостающее вручную "
+                "(это будет данные продавца, отдельно от карточки)."
+            )
+        else:
+            lines.append("")
+            lines.append(
+                "✅ Публичные цена/рейтинг/отзывы карточки получены автоматически."
+            )
+
+        # --- Market Recommendations ---
+        if market_recs:
+            market_block = self.build_market_block(market_recs)
+            if market_block:
+                lines.append(market_block)
 
         return "\n".join(lines)
 
@@ -314,6 +603,8 @@ class ReportBuilder:
         score_data: dict,
         recommendations: list,
         ai_comment: str | None = None,
+        market_recs: list[Recommendation] | None = None,
+        advisor_plan=None,
     ) -> str:
         """
         «📈 Полный анализ» — карточка (WBProduct) + данные продавца
@@ -327,14 +618,17 @@ class ReportBuilder:
         score = score_data["score"]
         reasons = score_data["reasons"]
         minuses = [r for r in reasons if r.startswith(_NEGATIVE)]
+        _, minuses = _filter_score_reasons_display(
+            [], minuses, product=product, advisor_plan=advisor_plan,
+        )
 
         lines = []
 
         lines.append("📈 <b>Полный анализ</b>")
         lines.append("")
 
-        # --- 📦 Данные карточки (WBProduct) ---
-        lines.append("📦 <b>Данные карточки</b>")
+        # --- 📦 Карточка (CARD / PUBLIC) ---
+        lines.append("📦 <b>Карточка</b>")
         lines.append(f"• Название: {html.escape(product.title or 'Без названия')}")
         if product.brand:
             lines.append(f"• Бренд: {html.escape(product.brand)}")
@@ -342,25 +636,69 @@ class ReportBuilder:
         lines.append(f"• Описание: {'есть' if product.description else 'нет'}")
         lines.append(f"• Фото: {len(product.photos)}")
         lines.append(f"• Характеристики: {len(product.characteristics)}")
+        lines.append(_card_commercial_line(product, "Публичная цена", "price", "₽"))
+        lines.append(_card_commercial_line(product, "Рейтинг карточки", "rating"))
+        lines.append(_card_commercial_line(product, "Отзывов на карточке (card_feedbacks)", "feedbacks"))
 
-        # --- 📊 Данные продавца (SellerData) ---
+        # --- 👤 Данные продавца (gap-fill / seller commercial only) ---
         lines.append("")
-        lines.append("📊 <b>Данные продавца</b>")
-        lines.append(_seller_line("💰 Цена", seller_data.price, "₽", seller_data.price_source))
-        lines.append(_seller_line("⭐ Рейтинг", seller_data.rating, "", seller_data.rating_source))
-        lines.append(_seller_line("💬 Отзывов", seller_data.feedbacks, "", seller_data.feedbacks_source))
+        lines.append("👤 <b>Данные продавца</b>")
+        if seller_data is None:
+            lines.append("• не указаны")
+        else:
+            has_seller_commercial = any(
+                getattr(seller_data, f, None) is not None
+                for f in ("price", "rating", "feedbacks")
+            )
+            if not has_seller_commercial:
+                lines.append("• не указаны (публичная карточка используется как есть)")
+            else:
+                lines.append(_seller_line("💰 Цена продавца", seller_data.price, "₽", seller_data.price_source))
+                lines.append(_seller_line("⭐ Рейтинг продавца", seller_data.rating, "", seller_data.rating_source))
+                lines.append(_seller_line("💬 Отзывов продавца", seller_data.feedbacks, "", seller_data.feedbacks_source))
 
-        if seller_data.sales is not None:
+        # --- 📈 Бизнес-метрики (PRIVATE) ---
+        lines.append("")
+        lines.append("📈 <b>Бизнес-метрики</b>")
+        if seller_data is None or not getattr(seller_data, "has_any_private_metrics", lambda: False)():
+            lines.append("• CTR: нет данных")
+            lines.append("• CVR: нет данных")
+            lines.append("• Показы: нет данных")
+            lines.append("• Просмотры: нет данных")
+            lines.append("• Продажи: нет данных")
+            lines.append("• Заказы: нет данных")
+            lines.append("• не могу оценить CTR/CVR/воронку без этих цифр")
+        else:
+            lines.append(_seller_line("CTR", getattr(seller_data, "ctr", None), "", getattr(seller_data, "ctr_source", None)))
+            lines.append(_seller_line("CVR", getattr(seller_data, "cvr", None), "", getattr(seller_data, "cvr_source", None)))
+            lines.append(_seller_line("Показы", getattr(seller_data, "impressions", None), "", getattr(seller_data, "impressions_source", None)))
+            lines.append(_seller_line("Просмотры", getattr(seller_data, "views", None), "", getattr(seller_data, "views_source", None)))
             lines.append(_seller_line("📈 Продажи", seller_data.sales, "", seller_data.sales_source))
-        if seller_data.orders is not None:
             lines.append(_seller_line("📦 Заказы", seller_data.orders, "", seller_data.orders_source))
-        if seller_data.period:
-            lines.append(f"• Период: {html.escape(seller_data.period)}")
+            lines.append(_seller_line("↩️ Возвраты", getattr(seller_data, "returns", None), "", getattr(seller_data, "returns_source", None)))
+            lines.append(_seller_line("📢 Реклама", getattr(seller_data, "ad_spend", None), "₽", getattr(seller_data, "ad_spend_source", None)))
+            lines.append(_seller_line("🧮 Себестоимость", getattr(seller_data, "cost", None), "₽", getattr(seller_data, "cost_source", None)))
+            lines.append(_seller_line("💳 Комиссия", getattr(seller_data, "commission", None), "", getattr(seller_data, "commission_source", None)))
+            lines.append(_seller_line("🚚 Логистика", getattr(seller_data, "logistics", None), "₽", getattr(seller_data, "logistics_source", None)))
+            lines.append(_seller_line("🏬 Хранение", getattr(seller_data, "storage", None), "₽", getattr(seller_data, "storage_source", None)))
+            if seller_data.period:
+                lines.append(f"• Период: {html.escape(seller_data.period)}")
+            if getattr(seller_data, "ctr", None) is None or getattr(seller_data, "cvr", None) is None:
+                lines.append("• не могу оценить CTR/CVR полностью — части данных нет")
 
         # --- 🧠 Анализ ---
         lines.append("")
         lines.append("🧠 <b>Анализ</b>")
-        lines.append(f"Оценка {AI_NAME}: <b>{score}/100</b> · {verdict_for(score)}")
+        kind = getattr(advisor_plan, "main_problem_kind", None) if advisor_plan else None
+        funnel_complete = bool(
+            seller_data is not None
+            and getattr(seller_data, "ctr", None) is not None
+            and getattr(seller_data, "cvr", None) is not None
+        )
+        lines.append(
+            f"Оценка {AI_NAME}: <b>{score}/100</b> · "
+            f"{verdict_for(score, diagnosis_kind=kind, funnel_complete=funnel_complete)}"
+        )
 
         # --- ⚠️ Проблемы ---
         if minuses:
@@ -368,17 +706,34 @@ class ReportBuilder:
             lines.append("⚠️ <b>Проблемы</b>")
             lines.extend(minuses)
 
-        # --- 💡 Рекомендации ---
-        if recommendations:
+        # --- 💡 Рекомендации (NO_SYSTEMIC: no generic card optimization) ---
+        recs = list(recommendations or [])
+        if kind == "no_systemic":
+            recs = [r for r in recs if not _is_generic_card_recommendation(str(r))]
+        if recs:
             lines.append("")
             lines.append("💡 <b>Рекомендации</b>")
-            for recommendation in recommendations:
+            for recommendation in recs:
                 lines.append(f"• {recommendation}")
 
         if ai_comment:
+            comment = ai_comment.strip()
+            if kind == "no_systemic":
+                comment = sanitize_no_systemic_comment(comment)
             lines.append("")
             lines.append(f"<b>Разбор от {AI_NAME}</b>")
-            lines.append(html.escape(ai_comment.strip()))
+            lines.append(html.escape(comment))
+
+        # --- Actionable Advisor ---
+        advisor_block = self.build_advisor_block(advisor_plan)
+        if advisor_block:
+            lines.append(advisor_block)
+
+        # --- Market Recommendations ---
+        if market_recs:
+            market_block = self.build_market_block(market_recs)
+            if market_block:
+                lines.append(market_block)
 
         return "\n".join(lines)
 

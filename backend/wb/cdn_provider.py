@@ -7,8 +7,8 @@ SellerOS · Wildberries product parser
 
   * ``basket-XX.wbbasket.ru/.../card.json``  — контент карточки (описание,
     характеристики, состав, сертификаты, кол-во фото);
-  * ``card.wb.ru/cards/v2/detail``           — цены, рейтинг, отзывы, склады
-    и остатки; **поддерживает батч до 100 артикулов за один запрос**;
+  * ``card.wb.ru/cards/v4/detail``           — цены, рейтинг, отзывы, склады
+    и остатки (primary; при 403 — ProductCardProvider fallback);
   * ``feedbacks{1,2}.wb.ru``                 — детальная статистика отзывов;
   * ``static-basket-01.wbbasket.ru``         — карточка продавца (ИНН/ОГРН).
 
@@ -53,6 +53,12 @@ try:  # curl_cffi >= 0.7
 except ImportError:  # pragma: no cover - старые версии
     HTTPTransportError = Exception  # type: ignore[misc,assignment]
 
+from backend.wb.product_card_provider import (
+    DETAIL_PRIMARY_URL,
+    ProductCardProvider,
+    needs_commercial_fallback,
+)
+
 __all__ = [
     "WBProduct",
     "WBSize",
@@ -68,9 +74,28 @@ log = logging.getLogger("selleros.wb")
 # Константы
 # --------------------------------------------------------------------------- #
 
-DETAIL_URL = "https://card.wb.ru/cards/v4/detail"
+DETAIL_URL = DETAIL_PRIMARY_URL  # card.wb.ru/cards/v4/detail
 SUPPLIER_URL = "https://static-basket-01.wbbasket.ru/vol0/data/supplier-by-id/{sid}.json"
 FEEDBACK_HOSTS = ("feedbacks1.wb.ru", "feedbacks2.wb.ru")
+
+
+def _proxy_scheme_from_proxies(proxies: dict[str, str] | None) -> str:
+    """Вытащить схему из dict curl_cffi proxies без пароля в логах."""
+    if not proxies:
+        try:
+            from backend.config import WB_PROXY_SCHEME
+            return (WB_PROXY_SCHEME or "socks5").strip().lower() or "socks5"
+        except Exception:
+            return "socks5"
+    for key in ("https", "http", "all"):
+        raw = (proxies.get(key) or "").strip()
+        if "://" in raw:
+            return raw.split("://", 1)[0].lower() or "socks5"
+    try:
+        from backend.config import WB_PROXY_SCHEME
+        return (WB_PROXY_SCHEME or "socks5").strip().lower() or "socks5"
+    except Exception:
+        return "socks5"
 
 #: Москва. Полный список — в ответе ``https://user-geo-data.wildberries.ru/get-geo-info``.
 DEFAULT_DEST = -1257786
@@ -178,6 +203,9 @@ class WBProduct:
     #: известный снимок из памяти ARGUS, источники сейчас недоступны).
     #: Добавлено для WB Engine — старый код это поле просто не читает.
     source: str = "live"
+    #: Минимальная provenance-мета: field → {value, source, nm_id, verified, scope, ts}.
+    #: Не влияет на старый код, который поле не читает.
+    field_provenance: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
     def url(self) -> str:
@@ -352,10 +380,68 @@ def _photo_count(card: dict[str, Any]) -> int:
     return int(card.get("pics") or 0)
 
 
+def _as_positive_int(value: Any) -> int | None:
+    """Привести id к int > 0; мусор → None. Без выдуманных значений."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def extract_imt_id(*sources: Any) -> int | None:
+    """
+    Достать imt_id из card.json / detail / search payload.
+
+    Реальные ключи WB (по существующим ответам/докам):
+      card.json: imt_id, imtId
+      detail/search: root  (это и есть imtId для feedbacks*.wb.ru)
+
+    Не подставляет article/nmId — это другой идентификатор.
+    """
+    for src in sources:
+        if src is None:
+            continue
+        if isinstance(src, (int, float, str)):
+            got = _as_positive_int(src)
+            if got is not None:
+                return got
+            continue
+        if not isinstance(src, dict):
+            continue
+        for key in ("imt_id", "imtId", "imtID", "root"):
+            got = _as_positive_int(src.get(key))
+            if got is not None:
+                return got
+        # редкий вложенный data{} — только реальный imt/root, НЕ subject_root_id
+        # (subject_root_id = категория, не IMT)
+        data = src.get("data")
+        if isinstance(data, dict):
+            for key in ("imt_id", "imtId", "imtID", "root"):
+                got = _as_positive_int(data.get(key))
+                if got is not None:
+                    return got
+    return None
+
+
+def _sync_imt_root(product: WBProduct) -> None:
+    """imt_id и root_id — взаимозаменяемые якоря для feedbacks API."""
+    if product.imt_id is None and product.root_id is not None:
+        product.imt_id = product.root_id
+    if product.root_id is None and product.imt_id is not None:
+        product.root_id = product.imt_id
+
+
 def product_from_card(article: int, card: dict[str, Any], basket: str) -> WBProduct:
     """Собирает продукт из ``card.json`` (контентная часть)."""
     selling = card.get("selling") or {}
     data = card.get("data") or {}
+
+    imt = extract_imt_id(card, data)
+    # root_id = только реальный imt/root. subject_root_id — категория, не якорь отзывов.
+    root = _as_positive_int(card.get("root")) or imt
 
     product = WBProduct(
         article=article,
@@ -366,12 +452,13 @@ def product_from_card(article: int, card: dict[str, Any], basket: str) -> WBProd
         brand=selling.get("brand_name") or card.get("selling", {}).get("brand"),
         supplier=selling.get("supplier_name"),
         supplier_id=selling.get("supplier_id"),
-        imt_id=card.get("imt_id"),
-        root_id=card.get("root") or data.get("subject_root_id"),
+        imt_id=imt,
+        root_id=root,
         subject_name=card.get("subj_name"),
         subject_root_name=card.get("subj_root_name"),
         characteristics=_extract_characteristics(card),
     )
+    _sync_imt_root(product)
 
     compositions = card.get("compositions") or []
     product.composition = [
@@ -386,35 +473,94 @@ def product_from_card(article: int, card: dict[str, Any], basket: str) -> WBProd
     if (card.get("media") or {}).get("has_video"):
         product.video = _video_url(basket, article)
 
+    from backend.wb.provenance import note_field
+
+    if product.description:
+        note_field(
+            product, "description", (product.description or "")[:80],
+            "card.json", verified=True, scope="nm",
+        )
+    if product.characteristics:
+        note_field(
+            product, "characteristics", len(product.characteristics),
+            "card.json", verified=True, scope="nm",
+        )
+    if product.photo_count:
+        note_field(
+            product, "photo_count", product.photo_count,
+            "card.json", verified=True, scope="nm",
+        )
+
     return product
 
 
 def apply_detail(product: WBProduct, raw: dict[str, Any]) -> WBProduct:
     """Накладывает данные detail-API: цены, рейтинг, размеры, остатки."""
+    from backend.wb.provenance import note_field, raw_nm_id
+
+    raw_id = raw_nm_id(raw)
+    if raw_id is not None and int(raw_id) != int(product.article):
+        log.warning(
+            "apply_detail refuse nm mismatch product=%s raw_id=%s",
+            product.article,
+            raw_id,
+        )
+        return product
+
     product.brand = raw.get("brand") or product.brand
     product.brand_id = raw.get("brandId")
     product.supplier = raw.get("supplier") or product.supplier
     product.supplier_id = raw.get("supplierId") or product.supplier_id
     product.supplier_rating = raw.get("supplierRating")
-    product.root_id = raw.get("root") or product.root_id
+
+    # root из detail/search = imtId для feedbacks*.wb.ru
+    detail_imt = extract_imt_id(raw)
+    if detail_imt is not None:
+        product.root_id = product.root_id or detail_imt
+        product.imt_id = product.imt_id or detail_imt
+    else:
+        product.root_id = raw.get("root") or product.root_id
+    _sync_imt_root(product)
+
     product.title = product.title or raw.get("name")
     product.is_promo = bool(raw.get("promoTextCard") or raw.get("panelPromoId"))
 
-    rating = raw.get("reviewRating") or raw.get("nmReviewRating") or raw.get("rating")
+    # nm-specific first (nmReviewRating / nmFeedbacks), затем card-level
+    rating = raw.get("nmReviewRating") or raw.get("reviewRating") or raw.get("rating")
     if rating:
         product.rating = round(float(rating), 2)
-        log.debug("article=%s rating=%.2f (источник: %s)", 
-                  product.article, product.rating,
-                  "reviewRating" if raw.get("reviewRating") else 
-                  "nmReviewRating" if raw.get("nmReviewRating") else "rating")
-    feedbacks = raw.get("feedbacks") or raw.get("nmFeedbacks")
+        note_field(
+            product, "rating", product.rating, "card.wb.ru/detail",
+            verified=True, scope="nm",
+        )
+        log.debug(
+            "article=%s rating=%.2f (источник: %s)",
+            product.article,
+            product.rating,
+            "nmReviewRating" if raw.get("nmReviewRating") is not None
+            else "reviewRating" if raw.get("reviewRating") is not None
+            else "rating",
+        )
+    feedbacks = (
+        raw.get("nmFeedbacks")
+        if raw.get("nmFeedbacks") is not None
+        else raw.get("feedbacks")
+    )
     if feedbacks is not None:
         product.feedbacks = int(feedbacks)
+        note_field(
+            product, "feedbacks", product.feedbacks, "card.wb.ru/detail",
+            verified=True, scope="nm",
+        )
         log.debug("article=%s feedbacks=%d", product.article, product.feedbacks)
 
     if not product.photo_count and raw.get("pics"):
         product.photo_count = int(raw["pics"])
         product.photos = product.photo_urls()
+        note_field(
+            product, "photo_count", product.photo_count, "card.wb.ru/detail.pics",
+            verified=True, scope="nm",
+        )
 
     warehouses: set[int] = set()
     total_qty = 0
@@ -468,7 +614,11 @@ def apply_detail(product: WBProduct, raw: dict[str, Any]) -> WBProduct:
         else:
             product.discount = 0
         product.wallet_price = round(product.price * (1 - WALLET_DISCOUNT))
-        
+        note_field(
+            product, "price", product.price, "card.wb.ru/detail",
+            verified=True, scope="nm",
+        )
+
         # Детальное логирование цен для отладки
         log.info(
             "Цены товара %s: price=%s руб, old_price=%s руб, discount=%s%%, "
@@ -515,12 +665,17 @@ class WBClient:
         self.batch_size = min(batch_size, MAX_BATCH)
         self.min_interval = min_interval
         self.baskets = BasketResolver(basket_cache)
+        self._proxies = proxies or {}
         self.session = requests.Session(
             headers=DEFAULT_HEADERS,
             impersonate=impersonate,
-            proxies=proxies or {},
+            proxies=self._proxies,
         )
         self._last_request = 0.0
+        self._card_provider = ProductCardProvider(
+            dest=dest,
+            proxy_scheme=_proxy_scheme_from_proxies(self._proxies),
+        )
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -550,6 +705,15 @@ class WBClient:
 
     def _get(self, url: str, params: dict[str, Any] | None = None) -> Any | None:
         """GET с ретраями. ``None`` — не удалось получить 2xx."""
+        response = self._get_response(url, params=params)
+        if response is None:
+            return None
+        if response.status_code == 200:
+            return response
+        return None
+
+    def _get_response(self, url: str, params: dict[str, Any] | None = None) -> Any | None:
+        """GET: вернуть response при любом HTTP-статусе; None только при обрыве."""
         for attempt in range(1, self.retries + 1):
             self._throttle()
             try:
@@ -564,12 +728,14 @@ class WBClient:
                 if response.status_code == 200:
                     return response
                 if response.status_code == 404:
-                    return None  # честный «нет такого» — ретраить бессмысленно
+                    return response
                 if response.status_code == 429 or response.status_code >= 500:
                     log.debug("GET %s -> %s (%d/%d)", url, response.status_code, attempt, self.retries)
+                    if attempt >= self.retries:
+                        return response
                 else:
                     log.warning("GET %s -> %s", url, response.status_code)
-                    return None
+                    return response
             if attempt < self.retries:
                 time.sleep(self._backoff(attempt))
         log.warning("GET %s: все %d попыток исчерпаны", url, self.retries)
@@ -601,28 +767,44 @@ class WBClient:
         return None, None
 
     def fetch_detail(self, articles: Sequence[int]) -> dict[int, dict[str, Any]]:
-        """Цены/остатки/рейтинг батчами по 100 артикулов."""
+        """Цены/остатки/рейтинг батчами по 100 артикулов (primary card.wb.ru)."""
         result: dict[int, dict[str, Any]] = {}
         for chunk in chunked(list(articles), self.batch_size):
-            params = {
-                "appType": "1",
-                "curr": "rub",
-                "lang": "ru",
-                "dest": str(self.dest),
-                "spp": "30",
-                "ab_testing": "false",
-                "nm": ";".join(str(a) for a in chunk),
-            }
-            response = self._get(DETAIL_URL, params=params)
-            if response is None:
-                continue
-            payload = self._json(response) or {}
-            for raw in payload.get("products") or []:
-                try:
-                    result[int(raw["id"])] = raw
-                except (KeyError, TypeError, ValueError):
-                    continue
+            part = self._card_provider.fetch_detail_primary(
+                list(chunk),
+                self._get_response,
+                json_loads=self._json,
+            )
+            result.update(part)
         return result
+
+    def _enrich_commercial(
+        self,
+        product: WBProduct,
+        *,
+        basket: str | None,
+    ) -> None:
+        """Graceful fallback коммерческих полей, если detail 403/пустой."""
+        if not needs_commercial_fallback(product):
+            return
+        try:
+            raw = self._card_provider.enrich_fallback(
+                product.article,
+                self._get_response,
+                json_loads=self._json,
+                name=product.title,
+                basket=basket or product.basket,
+                imt_id=product.imt_id or product.root_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "product card fallback failed article=%s: %s",
+                product.article,
+                exc,
+            )
+            return
+        if raw:
+            apply_detail(product, raw)
 
     def fetch_feedbacks(self, imt_id: int) -> dict[str, Any] | None:
         """Детальная статистика отзывов (распределение по звёздам)."""
@@ -682,13 +864,28 @@ class WBClient:
             if article in details:
                 apply_detail(product, details[article])
 
+            self._enrich_commercial(product, basket=basket)
+
             if with_feedbacks and product.imt_id:
                 stats = self.fetch_feedbacks(product.imt_id)
                 if stats:
-                    product.rating = float(
-                        stats.get("valuation") or product.rating or 0
-                    ) or product.rating
-                    product.feedbacks = stats.get("feedbackCount", product.feedbacks)
+                    from backend.wb.product_card_provider import raw_from_feedbacks_meta
+                    from backend.wb.provenance import note_field
+
+                    # IMT-wide valuation/feedbackCount — только если nm ownership доказан
+                    meta = raw_from_feedbacks_meta(stats, product.article)
+                    if product.rating is None and meta.get("reviewRating") is not None:
+                        product.rating = float(meta["reviewRating"])
+                        note_field(
+                            product, "rating", product.rating,
+                            "feedbacks1 (nm-safe)", verified=True, scope="nm",
+                        )
+                    if product.feedbacks is None and meta.get("feedbacks") is not None:
+                        product.feedbacks = int(meta["feedbacks"])
+                        note_field(
+                            product, "feedbacks", product.feedbacks,
+                            "feedbacks1 (nm-safe)", verified=True, scope="nm",
+                        )
 
             if with_supplier and product.supplier_id:
                 info = self.fetch_supplier(product.supplier_id)
@@ -735,6 +932,10 @@ class AsyncWBClient:
         self._impersonate = impersonate
         self._proxies = proxies or {}
         self.session: requests.AsyncSession | None = None
+        self._card_provider = ProductCardProvider(
+            dest=dest,
+            proxy_scheme=_proxy_scheme_from_proxies(self._proxies),
+        )
 
     async def __aenter__(self) -> "AsyncWBClient":
         self.session = requests.AsyncSession(
@@ -754,6 +955,15 @@ class AsyncWBClient:
             self.session = None
 
     async def _get(self, url: str, params: dict[str, Any] | None = None) -> Any | None:
+        response = await self._get_response(url, params=params)
+        if response is None:
+            return None
+        if response.status_code == 200:
+            return response
+        return None
+
+    async def _get_response(self, url: str, params: dict[str, Any] | None = None) -> Any | None:
+        """GET: response при любом HTTP-статусе; None только при обрыве транспорта."""
         assert self.session is not None, "используйте `async with AsyncWBClient()`"
         async with self._semaphore:
             for attempt in range(1, self.retries + 1):
@@ -770,11 +980,13 @@ class AsyncWBClient:
                     if response.status_code == 200:
                         return response
                     if response.status_code == 404:
-                        return None
+                        return response
                     if response.status_code != 429 and response.status_code < 500:
                         log.warning("GET %s -> %s", url, response.status_code)
-                        return None
+                        return response
                     log.debug("GET %s -> %s", url, response.status_code)
+                    if attempt >= self.retries:
+                        return response
                 if attempt < self.retries:
                     await asyncio.sleep(WBClient._backoff(attempt))
         log.warning("GET %s: все %d попыток исчерпаны", url, self.retries)
@@ -795,30 +1007,44 @@ class AsyncWBClient:
     async def fetch_detail(self, articles: Sequence[int]) -> dict[int, dict[str, Any]]:
         chunks = list(chunked(list(articles), self.batch_size))
 
-        async def one(chunk: Sequence[int]) -> list[dict[str, Any]]:
-            params = {
-                "appType": "1",
-                "curr": "rub",
-                "lang": "ru",
-                "dest": str(self.dest),
-                "spp": "30",
-                "ab_testing": "false",
-                "nm": ";".join(str(a) for a in chunk),
-            }
-            response = await self._get(DETAIL_URL, params=params)
-            if response is None:
-                return []
-            payload = WBClient._json(response) or {}
-            return payload.get("products") or []
+        async def one(chunk: Sequence[int]) -> dict[int, dict[str, Any]]:
+            return await self._card_provider.fetch_detail_primary_async(
+                list(chunk),
+                self._get_response,
+                json_loads=WBClient._json,
+            )
 
         result: dict[int, dict[str, Any]] = {}
-        for batch in await asyncio.gather(*(one(c) for c in chunks)):
-            for raw in batch:
-                try:
-                    result[int(raw["id"])] = raw
-                except (KeyError, TypeError, ValueError):
-                    continue
+        for part in await asyncio.gather(*(one(c) for c in chunks)):
+            result.update(part)
         return result
+
+    async def _enrich_commercial(
+        self,
+        product: WBProduct,
+        *,
+        basket: str | None,
+    ) -> None:
+        if not needs_commercial_fallback(product):
+            return
+        try:
+            raw = await self._card_provider.enrich_fallback_async(
+                product.article,
+                self._get_response,
+                json_loads=WBClient._json,
+                name=product.title,
+                basket=basket or product.basket,
+                imt_id=product.imt_id or product.root_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "product card fallback failed article=%s: %s",
+                product.article,
+                exc,
+            )
+            return
+        if raw:
+            apply_detail(product, raw)
 
     async def scan_many(self, articles: Iterable[int]) -> list[WBProduct]:
         unique = list(dict.fromkeys(int(a) for a in articles))
@@ -841,6 +1067,7 @@ class AsyncWBClient:
             )
             if article in details:
                 apply_detail(product, details[article])
+            await self._enrich_commercial(product, basket=basket)
             products.append(product)
 
         self.baskets.save()

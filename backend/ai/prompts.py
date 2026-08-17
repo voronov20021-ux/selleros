@@ -14,7 +14,7 @@ from backend.ai.personality import build_system
 from backend.config import AI_NAME
 
 
-def build_product_analysis_prompt(product) -> str:
+def build_product_analysis_prompt(product, advisor_text: str | None = None) -> str:
     """Промпт анализа карточки. product — WBProduct."""
 
     characteristics = "\n".join(
@@ -23,6 +23,14 @@ def build_product_analysis_prompt(product) -> str:
     ) or "нет данных"
 
     description = (product.description or "нет описания")[:1500]
+
+    advisor_section = ""
+    if advisor_text:
+        advisor_section = f"""
+
+ADVISOR PLAN (уже собран детерминированно — опирайся, не противоречь):
+{advisor_text[:2000]}
+"""
 
     return f"""Ты — {AI_NAME}, эксперт по продажам на маркетплейсе Wildberries.
 Продавец прислал свою карточку товара. Помоги ему увеличить продажи.
@@ -42,14 +50,27 @@ def build_product_analysis_prompt(product) -> str:
 
 Описание:
 {description}
-
+{advisor_section}
 ЗАДАНИЕ
 
-Дай краткий экспертный разбор строго в таком формате:
+Дай краткий экспертный разбор. Если есть ADVISOR PLAN — оберни его живым языком,
+сохрани цепочку: главный вывод → где проблема (locus) → что хорошо → что подтверждено →
+что не доказано → что делать → чего не хватает → приоритет P1/P2/P3.
+Не противоречь диагнозу: без PRICE-риска не советуй снижать цену.
+Не выдумывай факты, %, цены, магазины, CTR/CVR, рост рынка вне данных выше.
+IDEA из плана — не жалобы покупателей. Фото без разбора кадров — не выдумывай CV.
+Если карточка здоровая и нет экономики — «ничего критичного / ничего не менять».
+«Проанализировано N» — используй именно N.
+Если CTR/CVR/заказов нет — не пиши «системной проблемы с продажами не наблюдается».
+Пиши: «Системной проблемы по доступным данным пока не видно.»
+Рейтинг и число отзывов — факты, не «высокое доверие» и не причина продаж.
+Число фото — счётчик, не плюс и не качество. Жалобы (царапины, повреждения,
+ожидания, упаковка) не клади в «что уже хорошо».
 
-1. Сильные стороны (2-3 пункта)
-2. Слабые места (2-3 пункта)
-3. Конкретные действия для роста продаж (3-4 пункта, каждый начинай с глагола)
+Если ADVISOR PLAN нет, используй формат:
+1. Главный вывод (1-2 предложения)
+2. Что уже хорошо / что подтверждено
+3. Что делать (2-3 шага) + чего не хватает
 
 ПРАВИЛА ОТВЕТА
 
@@ -57,20 +78,18 @@ def build_product_analysis_prompt(product) -> str:
 - Не используй Markdown (звёздочки, решётки) — только обычный текст,
   нумерацию и тире.
 - Весь ответ — не длиннее 1200 символов.
-- Не выдумывай данные, которых нет в карточке.
+- Не выдумывай данные, которых нет в карточке / Advisor Plan.
 """
 
 
-def build_full_analysis_prompt(product, seller_data) -> str:
+def build_full_analysis_prompt(product, seller_data, advisor_text: str | None = None) -> str:
     """
-    Промпт «📈 Полного анализа» — карточка (product) + данные продавца
-    (seller_data) явно разделены на два раздела, CARD DATA и SELLER DATA.
+    Промпт «📈 Полного анализа» — CARD DATA и SELLER/PRIVATE явно разделены.
 
-    Важно: AI не должен сам догадываться о цене/рейтинге/отзывах.
-    Если seller_data.price/rating/feedbacks is None — модель получает
-    буквально "unavailable", а не отсутствие строки и не 0 — так модель
-    не может ни придумать число, ни спутать "нет данных" с "ноль".
+    public_price ≠ seller_price. Не выдумывать CTR/CVR/продажи/заказы.
+    unavailable / «нет данных» — буквально нет данных.
     """
+    from backend.wb.provenance import field_provenance_label
 
     characteristics = "\n".join(
         f"- {name}: {value}"
@@ -79,21 +98,45 @@ def build_full_analysis_prompt(product, seller_data) -> str:
 
     description = (product.description or "нет описания")[:1500]
 
-    price = "unavailable" if seller_data.price is None else f"{seller_data.price} руб."
-    rating = "unavailable" if seller_data.rating is None else str(seller_data.rating)
-    feedbacks = "unavailable" if seller_data.feedbacks is None else str(seller_data.feedbacks)
-    sales = "unavailable" if seller_data.sales is None else str(seller_data.sales)
-    orders = "unavailable" if seller_data.orders is None else str(seller_data.orders)
-    period = "unavailable" if not seller_data.period else seller_data.period
+    def _card_val(field, unit=""):
+        val = getattr(product, field, None)
+        if val is None:
+            return "нет данных"
+        prov = field_provenance_label(product, field)
+        base = f"{val}{(' ' + unit) if unit else ''}"
+        return f"{base} [Источник: {prov}]" if prov else base
+
+    card_price = _card_val("price", "руб.")
+    card_rating = _card_val("rating")
+    card_feedbacks = _card_val("feedbacks")
+
+    def _priv(attr, unit=""):
+        if seller_data is None:
+            return "нет данных"
+        val = getattr(seller_data, attr, None)
+        if val is None:
+            return "нет данных"
+        return f"{val}{(' ' + unit) if unit else ''}"
+
+    advisor_section = ""
+    if advisor_text:
+        advisor_section = f"""
+
+ADVISOR PLAN (детерминированный — опирайся, не противоречь):
+{advisor_text[:2000]}
+"""
 
     return f"""Ты — {AI_NAME}, эксперт по продажам на маркетплейсе Wildberries.
-Продавец прислал карточку товара и данные о продавце. Помоги ему увеличить продажи.
+Продавец прислал карточку товара. Помоги увеличить продажи. Не выдумывай цифры.
 
-CARD DATA (получено автоматически с карточки Wildberries)
+CARD DATA (публичная карточка Wildberries / PUBLIC_BROWSER)
 
 Название: {product.title or "нет"}
 Бренд: {product.brand or "нет"}
 Фотографий: {len(product.photos)}
+Публичная цена (public_price): {card_price}
+Рейтинг карточки: {card_rating}
+Отзывов на карточке (card_feedbacks): {card_feedbacks}
 
 Характеристики:
 {characteristics}
@@ -101,22 +144,49 @@ CARD DATA (получено автоматически с карточки Wildb
 Описание:
 {description}
 
-SELLER DATA (указано продавцом или получено через Seller API)
-
-Цена: {price}
-Рейтинг: {rating}
-Отзывов: {feedbacks}
-Продажи: {sales}
-Заказы: {orders}
-Период: {period}
-
+SELLER / PRIVATE ANALYTICS (только если продавец указал; иначе «нет данных»)
+Цена продавца (seller_price): {_priv("price", "руб.")}
+Рейтинг продавца: {_priv("rating")}
+Отзывов продавца: {_priv("feedbacks")}
+CTR: {_priv("ctr")}
+CVR: {_priv("cvr")}
+Показы: {_priv("impressions")}
+Просмотры: {_priv("views")}
+Продажи: {_priv("sales")}
+Заказы: {_priv("orders")}
+Возвраты: {_priv("returns")}
+Рекламные расходы: {_priv("ad_spend")}
+Себестоимость: {_priv("cost")}
+Комиссия: {_priv("commission")}
+Логистика: {_priv("logistics")}
+Хранение: {_priv("storage")}
+Период: {_priv("period")}
+{advisor_section}
 ЗАДАНИЕ
 
-Дай краткий экспертный разбор строго в таком формате:
+Дай краткий экспертный разбор. Если есть ADVISOR PLAN — оберни живым языком,
+сохраняя: главный вывод → где проблема (X не Y) → что хорошо → подтверждено →
+не доказано → что делать → чего не хватает → приоритет P1/P2/P3.
+IDEA ≠ жалобы покупателей и не в «что подтверждено». Не выдумывай факты вне данных.
+«нет данных» / unavailable означает, что этих данных НЕТ — так и скажи.
+Если CTR/CVR нет — напиши: «не могу оценить CTR/CVR».
+Не путай public_price и seller_price.
+Не пиши универсальные советы без основания в CARD/Advisor/отзывах.
+Для отзывов опирайся на processed_reviews из Advisor, не на выдуманный n.
+Если карточка здоровая и нет экономики — можно сказать «ничего не трогай».
+Если CTR/CVR/заказов нет — не пиши «системной проблемы с продажами не наблюдается».
+Пиши: «Системной проблемы по доступным данным пока не видно.»
+Не превращай рейтинг/число отзывов в «высокое доверие» или вывод про продажи.
+Verified поле (рейтинг, цена, число отзывов) ≠ diagnostic confidence.
+Не пиши «цена адекватная» без confirmed commercial fields конкурентов.
+Не пиши, что характеристики негативно влияют на продажи, без доказанной связи.
+Не пиши «есть спрос» без CTR/CVR/заказов или sales.
+Число фото ≠ плюс/качество. Не клади жалобы из отзывов в «что уже хорошо».
 
-1. Сильные стороны (2-3 пункта)
-2. Слабые места (2-3 пункта)
-3. Конкретные действия для роста продаж (3-4 пункта, каждый начинай с глагола)
+Если ADVISOR PLAN нет:
+1. Главный вывод
+2. Что подтверждено / что не доказано
+3. Что делать + чего не хватает
 
 ПРАВИЛА ОТВЕТА
 
@@ -124,9 +194,7 @@ SELLER DATA (указано продавцом или получено чере�
 - Не используй Markdown (звёздочки, решётки) — только обычный текст,
   нумерацию и тире.
 - Весь ответ — не длиннее 1200 символов.
-- Значение "unavailable" означает, что этих данных НЕТ. Не придумывай
-  их и не заменяй предположением — если данных не хватает для вывода,
-  так и скажи.
+- Не придумывай CTR, CVR, заказы, возвраты, маржу, рекламу, число отзывов.
 """
 
 

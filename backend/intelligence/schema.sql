@@ -216,3 +216,236 @@ CREATE INDEX IF NOT EXISTS idx_me_date
 
 CREATE INDEX IF NOT EXISTS idx_me_type
     ON market_events (event_type, event_date DESC);
+
+
+-- ──────────────────────────────── api_calls ─────────────────
+-- Учёт реальных HTTP-запросов к внешним API (Yandex Search).
+-- Используется YandexCostGuard для ограничения расхода лимита.
+-- called_at — unix timestamp вызова.
+
+CREATE TABLE IF NOT EXISTS api_calls (
+    id          TEXT PRIMARY KEY,
+    source_id   TEXT NOT NULL,
+    query       TEXT,
+    category    TEXT,
+    region      TEXT,
+    called_at   REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ac_source_ts
+    ON api_calls (source_id, called_at DESC);
+
+
+-- ──────────────────────────────── action_outcomes ──────────
+-- Результаты действий продавца / рекомендаций Argus.
+-- Learning Loop v1: память «сделали X → получили Y».
+
+CREATE TABLE IF NOT EXISTS action_outcomes (
+    id                   TEXT  PRIMARY KEY,
+    user_hash            TEXT  NOT NULL,
+    category             TEXT  NOT NULL,
+    article              TEXT,
+    recommendation_type  TEXT  NOT NULL,
+    action               TEXT  NOT NULL,
+    period_start         REAL  NOT NULL,
+    period_end           REAL  NOT NULL,
+    created_at           REAL  NOT NULL,
+    metrics_before       TEXT  NOT NULL DEFAULT '{}',
+    metrics_after        TEXT  NOT NULL DEFAULT '{}',
+    outcome_direction    TEXT  NOT NULL DEFAULT 'unknown'
+                               CHECK (outcome_direction IN (
+                                   'positive', 'negative', 'neutral', 'unknown'
+                               )),
+    outcome_score        REAL  NOT NULL DEFAULT 0.0
+                               CHECK (outcome_score BETWEEN -1.0 AND 1.0),
+    confidence           REAL  NOT NULL DEFAULT 0.5
+                               CHECK (confidence BETWEEN 0.0 AND 1.0),
+    evidence_ids         TEXT  NOT NULL DEFAULT '[]',
+    metadata             TEXT  NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_ao_category
+    ON action_outcomes (category, period_end DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ao_action
+    ON action_outcomes (action, category, period_end DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ao_user
+    ON action_outcomes (user_hash, period_end DESC);
+
+
+-- ──────────────────────────────── learning_signals ─────────
+-- Сигналы, извлечённые LearningBrain из ActionOutcome.
+
+CREATE TABLE IF NOT EXISTS learning_signals (
+    id           TEXT  PRIMARY KEY,
+    outcome_id   TEXT  REFERENCES action_outcomes(id),
+    signal_type  TEXT  NOT NULL,
+    claim        TEXT  NOT NULL,
+    confidence   REAL  NOT NULL DEFAULT 0.5
+                       CHECK (confidence BETWEEN 0.0 AND 1.0),
+    evidence_ids TEXT  NOT NULL DEFAULT '[]',
+    metadata     TEXT  NOT NULL DEFAULT '{}',
+    created_at   REAL  NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ls_outcome
+    ON learning_signals (outcome_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ls_type
+    ON learning_signals (signal_type, created_at DESC);
+
+
+-- ──────────────────────────────── recommendation_outcomes ──
+-- Жизненный цикл рекомендаций Argus → действие → результат.
+-- OutcomeTracker v1. UNKNOWN — нормальное состояние до record_result().
+
+CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+    id                        TEXT  PRIMARY KEY,
+    user_hash                 TEXT  NOT NULL,
+    category                  TEXT  NOT NULL,
+    article                   TEXT,
+    recommendation_type       TEXT  NOT NULL,
+    recommendation_action     TEXT  NOT NULL,
+    recommendation_confidence REAL  NOT NULL DEFAULT 0.0
+                                    CHECK (recommendation_confidence BETWEEN 0.0 AND 1.0),
+    recommended_at            REAL  NOT NULL,
+    action_taken              TEXT,
+    action_taken_at           REAL,
+    period_start              REAL,
+    period_end                REAL,
+    metrics_before            TEXT  NOT NULL DEFAULT '{}',
+    metrics_after             TEXT  NOT NULL DEFAULT '{}',
+    outcome_direction         TEXT  NOT NULL DEFAULT 'unknown'
+                                    CHECK (outcome_direction IN (
+                                        'positive', 'negative', 'mixed', 'unknown'
+                                    )),
+    outcome_score             REAL  CHECK (
+                                    outcome_score IS NULL
+                                    OR (outcome_score BETWEEN -1.0 AND 1.0)
+                                ),
+    confidence                REAL  NOT NULL DEFAULT 0.0
+                                    CHECK (confidence BETWEEN 0.0 AND 1.0),
+    evidence_ids              TEXT  NOT NULL DEFAULT '[]',
+    metadata                  TEXT  NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_ro_category
+    ON recommendation_outcomes (category, recommended_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ro_article
+    ON recommendation_outcomes (article, recommended_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ro_type
+    ON recommendation_outcomes (recommendation_type, recommended_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ro_recommended_at
+    ON recommendation_outcomes (recommended_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ro_direction
+    ON recommendation_outcomes (outcome_direction, recommended_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ro_user
+    ON recommendation_outcomes (user_hash, recommended_at DESC);
+
+
+-- ──────────────────────────────── review intelligence ──
+-- Сигналы и recurring issues из отзывов товара.
+-- seller isolation через user_hash (без raw user_id).
+
+CREATE TABLE IF NOT EXISTS review_signals (
+    id           TEXT  PRIMARY KEY,
+    user_hash    TEXT  NOT NULL,
+    article      TEXT,
+    category     TEXT,
+    signal_type  TEXT  NOT NULL,
+    sentiment    TEXT  NOT NULL,
+    claim        TEXT  NOT NULL,
+    confidence   REAL  NOT NULL DEFAULT 0.5
+                       CHECK (confidence BETWEEN 0.0 AND 1.0),
+    source_ids   TEXT  NOT NULL DEFAULT '[]',
+    source_url   TEXT,
+    review_id    TEXT,
+    created_at   REAL  NOT NULL,
+    metadata     TEXT  NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_rs_user_article
+    ON review_signals (user_hash, article, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_rs_category
+    ON review_signals (category, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_rs_type
+    ON review_signals (signal_type, sentiment, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS review_issues (
+    id           TEXT  PRIMARY KEY,
+    user_hash    TEXT  NOT NULL,
+    article      TEXT,
+    category     TEXT,
+    signal_type  TEXT  NOT NULL,
+    sentiment    TEXT  NOT NULL,
+    claim        TEXT  NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 1,
+    ratio        REAL  NOT NULL DEFAULT 0.0
+                       CHECK (ratio BETWEEN 0.0 AND 1.0),
+    confidence   REAL  NOT NULL DEFAULT 0.5
+                       CHECK (confidence BETWEEN 0.0 AND 1.0),
+    source_ids   TEXT  NOT NULL DEFAULT '[]',
+    created_at   REAL  NOT NULL,
+    metadata     TEXT  NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_ri_user_article
+    ON review_issues (user_hash, article, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ri_category
+    ON review_issues (category, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ri_type
+    ON review_issues (signal_type, sentiment, count DESC);
+
+
+-- ──────────────────────────────── competitor_evidence_cache ──────────
+-- Ranked competitor evidence для ARGUS (отдельно от сырых knowledge_items).
+-- TTL задаётся expires_at. Identity = competitor_id (wb:{nm_id} или url:...).
+
+CREATE TABLE IF NOT EXISTS competitor_evidence_cache (
+    id             TEXT PRIMARY KEY,
+    query          TEXT NOT NULL,
+    product_id     TEXT NOT NULL,
+    competitor_id  TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    data           TEXT NOT NULL,
+    retrieved_at   REAL NOT NULL,
+    expires_at     REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cec_product_query
+    ON competitor_evidence_cache (product_id, query, expires_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cec_unique
+    ON competitor_evidence_cache (query, product_id, competitor_id);
+
+
+-- ──────────────────────────────── competitor_snapshots ──────────
+-- История коммерческих полей конкурента (не live-мониторинг).
+-- Identity = competitor_id (wb:{nm_id} или url:{normalized_url}).
+-- Не смешивает IMT / seller / чужие nm.
+
+CREATE TABLE IF NOT EXISTS competitor_snapshots (
+    id             TEXT PRIMARY KEY,
+    competitor_id  TEXT NOT NULL,
+    query          TEXT,
+    product_id     TEXT,
+    price          INTEGER,
+    rating         REAL,
+    feedbacks      INTEGER,
+    captured_at    REAL NOT NULL,
+    source         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_csnap_competitor
+    ON competitor_snapshots (competitor_id, captured_at DESC);
+

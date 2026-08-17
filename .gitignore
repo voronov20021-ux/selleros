@@ -1,11 +1,15 @@
-# Environment
+# Environment (keep !.env.example so the template CAN be committed)
 .env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
+*.pyo
 *$py.class
 *.so
 .Python
@@ -44,6 +48,7 @@ desktop.ini
 
 # Logs & temp
 *.log
+*.tmp
 logs/
 tmp/
 temp/
@@ -51,6 +56,9 @@ temp/
 
 # Database
 *.db
+*.db-shm
+*.db-wal
+*.sqlite
 *.sqlite3
 
 # Secrets & credentials
@@ -70,3 +78,25 @@ htmlcov/
 *.pyc
 .mypy_cache/
 .ruff_cache/
+
+# Frontend
+node_modules/
+
+# WB / local caches
+.wb_basket_cache.json
+**/.wb_basket_cache.json
+
+# Local browser profiles, Playwright temp, screenshots
+**/selleros_chrome*/
+**/.pw-user-data/
+**/.playwright/
+**/playwright-report/
+**/test-results/
+**/screenshots/
+**/*screenshot*.png
+ms-playwright/
+
+# Temporary diagnostics (do NOT ignore scripts/test_*.py)
+data/_tmp_*
+scripts/_tmp_*
+*.live_smoke

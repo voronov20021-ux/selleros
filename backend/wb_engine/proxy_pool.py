@@ -128,26 +128,37 @@ class ProxyPool:
         proxy_pool.mark_blocked("403")
     """
     
-    def __init__(self, proxies: list[str] | None = None):
+    def __init__(self, proxies: list[str] | None = None, *, scheme: str | None = None):
         """
         Инициализация пула.
-        
+
         Args:
-            proxies: Список URL прокси в формате http://user:pass@host:port
+            proxies: Список URL прокси
+            scheme: http | socks5 — нормализует URL (socks5 → socks5h)
         """
-        proxy_urls = [p.strip() for p in (proxies or []) if p.strip()]
-        
+        from backend.browser.proxy import normalize_wb_proxy_url
+
+        scheme = (scheme or "http").strip().lower()
+        proxy_urls = []
+        for p in (proxies or []):
+            raw = (p or "").strip()
+            if not raw:
+                continue
+            proxy_urls.append(normalize_wb_proxy_url(raw, scheme=scheme))
+
+        self._scheme = scheme
         self._proxies: list[ProxyState] = []
         for url in proxy_urls:
             self._proxies.append(ProxyState(url=url))
-        
+
         self._current_index: int = 0
         self._last_used_proxy: Optional[ProxyState] = None
-        
+
         if self._proxies:
             log.info(
-                "ProxyPool инициализирован: %d прокси",
-                len(self._proxies)
+                "ProxyPool инициализирован: %d прокси (scheme=%s)",
+                len(self._proxies),
+                "socks5h" if scheme.startswith("socks") else "http",
             )
         else:
             log.warning("ProxyPool: прокси не настроены (идем без прокси)")
@@ -286,14 +297,18 @@ class ProxyPool:
             )
     
     @classmethod
-    def from_env_value(cls, raw: str) -> "ProxyPool":
+    def from_env_value(cls, raw: str, *, scheme: str | None = None) -> "ProxyPool":
         """
         Создать из значения переменной окружения.
-        
+
         Args:
             raw: Строка формата "url1,url2,url3" или пустая
-        
-        Returns:
-            ProxyPool с прокси или пустой пул
+            scheme: http | socks5 (по умолчанию из config.WB_PROXY_SCHEME)
         """
-        return cls(raw.split(",")) if raw else cls()
+        if scheme is None:
+            try:
+                from backend.config import WB_PROXY_SCHEME
+                scheme = WB_PROXY_SCHEME
+            except Exception:
+                scheme = "socks5"
+        return cls(raw.split(",") if raw else [], scheme=scheme)

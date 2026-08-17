@@ -29,6 +29,11 @@ class Intent(str, Enum):
     REVIEWS = "REVIEWS"
     LOGISTICS = "LOGISTICS"
     COMPETITOR = "COMPETITOR"
+    SOLUTION_RESEARCH = "SOLUTION_RESEARCH"
+    FINANCE = "FINANCE"
+    KNOWLEDGE = "KNOWLEDGE"
+    WB_POLICY = "WB_POLICY"
+    ACTION_CHECK = "ACTION_CHECK"
 
 
 #: Ключевые корни слов по темам. Сравнение идёт по началу слова,
@@ -66,16 +71,51 @@ KEYWORDS: dict[Intent, tuple[str, ...]] = {
         "запас", "оборачива",
     ),
 
+    Intent.SOLUTION_RESEARCH: (
+        "где купить", "где найти", "где взять", "где заказать",
+        "что купить", "что заказать", "чем заменить",
+        "какой лучше", "какая лучше", "сравни", "дешевле", "красивее",
+        "сколько стоит", "какой размер", "наполнитель",
+        "купить короб", "купить упаков", "красивые дешев", "красивые дешёв",
+        "найди упаков", "варианты упаков", "какую из", "ты бы выбрал",
+        "какой бы выбрал", "поставщик",
+    ),
+
     Intent.COMPETITOR: (
         "конкурент", "соперник", "у других", "у остальн", "ниш",
-        "сравни", "сравнен", "лидер", "аналог", "чужую карточк",
+        "сравнен", "лидер", "аналог", "чужую карточк",
     ),
 
     Intent.SELLER_ANALYTICS: (
-        "продаж", "выручк", "заказ", "оборот", "статистик", "аналитик",
+        "продаж", "продают", "выручк", "заказ", "оборот", "статистик", "аналитик",
         "воронк", "конверси", "ctr", "цтр", "cr", "дрр", "roi", "ромi",
         "прибыл", "убыт", "отчет", "отчёт", "динамик", "метрик",
         "выкуп", "процент выкуп",
+        "тренд", "прогноз", "как изменил",
+    ),
+
+    Intent.FINANCE: (
+        "закуп", "закупк", "закупочн", "себестоим", "маржинальн",
+        "безубыточн", "окупаем", "парти", "за кг", "руб/кг",
+        "сколько выйдет", "сколько все выйдет", "сколько всё выйдет",
+        "сколько будет стоить", "стоит ли закуп", "юнит эконом",
+        "unit economics", "цена закупки",
+    ),
+
+    Intent.KNOWLEDGE: (
+        "что такое", "что значит", "как посчитать", "как рассчитать",
+        "из чего складывается", "какие расходы учитывать",
+        "определение", "формула марж", "формула ctr", "формула cvr",
+    ),
+
+    Intent.WB_POLICY: (
+        "штраф wb", "штраф wildberries", "оферт", "пункт оферты",
+        "перечень штраф", "за что штраф", "удержан wb",
+    ),
+
+    Intent.ACTION_CHECK: (
+        "проверить результат", "сработало ли", "неделю назад мы",
+        "помоги проверить", "после смены фото",
     ),
 }
 
@@ -181,6 +221,27 @@ def classify(text: str, *, has_product: bool = False) -> Intent:
 
     if not text:
         return Intent.GENERAL_QUESTION
+
+    # Finance / funnel — до small talk: короткие деловые фразы
+    # («не продаются») не должны ловиться на «да» внутри слова.
+    try:
+        from backend.ai.finance_planner import is_finance_query
+        if is_finance_query(text):
+            return Intent.FINANCE
+    except Exception:
+        pass
+    try:
+        from backend.ai.dynamic_analytics import is_dynamics_query
+        if is_dynamics_query(text):
+            return Intent.SELLER_ANALYTICS
+    except Exception:
+        pass
+    try:
+        from backend.ai.funnel_economics import is_funnel_query
+        if is_funnel_query(text):
+            return Intent.SELLER_ANALYTICS
+    except Exception:
+        pass
 
     if is_small_talk(text):
         return Intent.SMALL_TALK

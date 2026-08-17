@@ -41,6 +41,7 @@ from backend.memory import MemoryStore
 from backend.services.history import HistoryService
 from backend.services.product_service import ProductService
 from backend.services.session import SessionService
+from backend.utils.telegram_split import edit_or_answer_long
 
 import html
 import time
@@ -50,10 +51,12 @@ router = Router()
 
 async def _render(callback: CallbackQuery, text: str, keyboard) -> None:
     """Аккуратно перерисовать экран (или отправить новый, если нельзя)."""
-    try:
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    await edit_or_answer_long(
+        callback.message,
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
@@ -209,6 +212,7 @@ async def refresh_product(
     analyzer: AIAnalyzer,
     session: SessionService,
     history: HistoryService,
+    wb_reviews=None,
 ):
     # Отвечаем на нажатие СРАЗУ и один раз — дальше несколько
     # редактирований одного и того же сообщения, без повторных answer().
@@ -218,7 +222,15 @@ async def refresh_product(
 
     await callback.message.edit_text(f"⏳ {AI_NAME} обновляет данные...")
 
-    product = await product_service.get_product("wildberries", article)
+    # Explicit refresh: allow Browser if cache STALE/MISS (force_refresh).
+    if hasattr(product_service, "get_product_snapshot"):
+        product = await product_service.get_product_snapshot(
+            "wildberries",
+            article,
+            force_refresh=True,
+        )
+    else:
+        product = await product_service.get_product("wildberries", article)
 
     if product is None:
         await callback.message.edit_text(
@@ -235,6 +247,13 @@ async def refresh_product(
         product=product,
         analysis=result,
     )
+    if wb_reviews is not None:
+        try:
+            await wb_reviews.load_into_session(
+                session, callback.from_user.id, product,
+            )
+        except Exception:
+            pass
     await history.add(
         user_id=callback.from_user.id,
         article=product.article,
@@ -244,7 +263,8 @@ async def refresh_product(
         verdict=verdict_for(result["score"]),
     )
 
-    await callback.message.edit_text(
+    await edit_or_answer_long(
+        callback.message,
         result["report"],
         reply_markup=after_analysis_kb(),
         parse_mode="HTML",

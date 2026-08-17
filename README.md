@@ -37,6 +37,14 @@ pip install -r requirements.txt
 | [03_Architecture.md](docs/03_Architecture.md) | Архитектура системы |
 | [PROJECT_RULES.md](docs/PROJECT_RULES.md) | Правила проекта |
 
+## Telegram Mini App (GitHub Pages)
+
+Фронтенд: `frontend/seller_dashboard`. Команды деплоя, переменная `VITE_API_BASE` и поля BotFather — в [frontend/seller_dashboard/README.md](frontend/seller_dashboard/README.md).
+
+Публичный URL (после вашего commit + push в `main` и успешного GitHub Actions): **https://voronov20021-ux.github.io/selleros/**
+
+В репозитории: **Settings → Pages → Source = GitHub Actions**.
+
 ## Лицензия
 
 Proprietary. All rights reserved.

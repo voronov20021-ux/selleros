@@ -39,7 +39,13 @@ class HistoryFallbackSource(DataSource):
             price=record.price,
             rating=record.rating,
             photo_count=record.photos,
+            imt_id=getattr(record, "imt_id", None),
+            root_id=getattr(record, "root_id", None),
         )
+        if product.imt_id is None and product.root_id is not None:
+            product.imt_id = product.root_id
+        if product.root_id is None and product.imt_id is not None:
+            product.root_id = product.imt_id
         product.source = "history"
         product.scanned_at = record.last_seen
 

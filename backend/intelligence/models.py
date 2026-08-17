@@ -98,6 +98,7 @@ class EventType(str, Enum):
     REGULATION  = "regulation"  # изменение правил площадки или законодательства
     COMPETITOR  = "competitor"  # действие конкурента
     PLATFORM    = "platform"    # изменения на самой платформе WB
+    ECONOMIC    = "economic"    # макроэкономическое событие (курс, инфляция, санкции)
 
 
 # ───────────────────────────────────────────────────────── модели ──────── #
@@ -287,4 +288,148 @@ class MarketEvent:
     region: str | None = None
     impact_direction: ImpactDirection | None = None
     confidence: float = 1.0
+    metadata: dict = field(default_factory=dict)
+
+
+# ────────────────────────────────────────────────── review intelligence ── #
+
+
+class ReviewSignalType(str, Enum):
+    """Категории Review Intelligence v2 (расширяемые). Старые алиасы сохранены."""
+
+    # v2 primary
+    PACKAGING          = "PACKAGING"
+    UNPACKING          = "UNPACKING"
+    COMPLETENESS       = "COMPLETENESS"
+    PRODUCT_QUALITY    = "PRODUCT_QUALITY"
+    FUNCTIONALITY      = "FUNCTIONALITY"
+    PHOTO_MATCH        = "PHOTO_MATCH"
+    DESCRIPTION_MATCH  = "DESCRIPTION_MATCH"
+    SIZE               = "SIZE"
+    DESIGN             = "DESIGN"
+    LOGISTICS          = "LOGISTICS"       # только если сигнал из отзывов
+    EXPECTATIONS       = "EXPECTATIONS"
+    # back-compat / adjacent
+    QUALITY            = "QUALITY"         # → prefer PRODUCT_QUALITY
+    DAMAGE             = "DAMAGE"
+    DELIVERY           = "DELIVERY"        # → prefer LOGISTICS
+    APPEARANCE         = "APPEARANCE"      # → prefer PHOTO_MATCH / DESIGN
+    PRICE_VALUE        = "PRICE_VALUE"
+    SERVICE            = "SERVICE"
+    OTHER              = "OTHER"
+
+
+class ReviewSentiment(str, Enum):
+    POSITIVE = "POSITIVE"
+    NEGATIVE = "NEGATIVE"
+    NEUTRAL  = "NEUTRAL"
+    UNKNOWN  = "UNKNOWN"
+
+
+class SignalSeverity(str, Enum):
+    CRITICAL = "critical"
+    HIGH     = "high"
+    MEDIUM   = "medium"
+    LOW      = "low"
+
+
+@dataclass
+class ReviewSignal:
+    """Один нормализованный сигнал из отзыва."""
+
+    id: str
+    category: str | None
+    signal_type: ReviewSignalType
+    sentiment: ReviewSentiment
+    claim: str
+    confidence: float
+    source_ids: list[str] = field(default_factory=list)
+    user_hash: str | None = None
+    article: str | None = None
+    source_url: str | None = None
+    review_id: str | None = None
+    created_at: float = 0.0
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ReviewIssue:
+    """Группа похожих отзывов (recurring issue / strength)."""
+
+    id: str
+    category: str | None
+    signal_type: ReviewSignalType
+    sentiment: ReviewSentiment
+    claim: str
+    count: int
+    ratio: float
+    confidence: float
+    source_ids: list[str] = field(default_factory=list)
+    user_hash: str | None = None
+    article: str | None = None
+    created_at: float = 0.0
+    metadata: dict = field(default_factory=dict)
+
+
+class SignalFrequency(str, Enum):
+    HIGH   = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW    = "LOW"
+
+
+class ProblemDirection(str, Enum):
+    NEGATIVE = "negative"
+    POSITIVE = "positive"
+    MIXED    = "mixed"
+
+
+@dataclass
+class SellerProblem:
+    """Нормализованная проблема/сильная сторона для продавца (не raw отзыв)."""
+
+    id: str
+    label: str
+    frequency: SignalFrequency
+    confidence: float
+    direction: ProblemDirection
+    priority: int  # 1=P1 … 4=P4
+    signal_type: ReviewSignalType
+    evidence_ids: list[str] = field(default_factory=list)
+    examples: list[str] = field(default_factory=list)
+    claim: str = ""
+    count: int = 0
+    severity: SignalSeverity = SignalSeverity.LOW
+    rationale: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class SellerAction:
+    """Конкретное действие продавца на основе review-сигнала."""
+
+    id: str
+    title: str
+    rationale: str
+    confidence: float
+    priority: int  # 1=P1 … 4=P4
+    evidence_ids: list[str] = field(default_factory=list)
+    problem_id: str | None = None
+    signal_type: ReviewSignalType | None = None
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ReviewAssessment:
+    """Сводный результат ReviewIntelligence по товару/категории."""
+
+    category: str | None
+    article: str | None = None
+    user_hash: str | None = None
+    processed_count: int = 0
+    signals: list[ReviewSignal] = field(default_factory=list)
+    issues: list[ReviewIssue] = field(default_factory=list)
+    problems: list[SellerProblem] = field(default_factory=list)
+    actions: list[SellerAction] = field(default_factory=list)
+    confidence: float = 0.0
+    generated_at: float = 0.0
     metadata: dict = field(default_factory=dict)

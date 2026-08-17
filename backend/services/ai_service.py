@@ -1,20 +1,11 @@
 """
 AIService — ЕДИНАЯ точка входа в AI для всего проекта.
 
-Правило проекта:
-    Никто в SellerOS не вызывает Claude/GPT/Gemini напрямую.
-    Все вызовы AI идут только через AIService.
+Routing:
+    PRIMARY_MODEL → FALLBACK_MODEL → остальные из FALLBACK_ORDER
 
-Для пользователя это всегда «Seller AI».
-Какая модель под капотом — деталь реализации, наружу не протекает.
-
-    Telegram -> Seller AI -> AIService -> ClaudeProvider
-             -> VseGPT API -> Claude Sonnet 5
-
-Провайдер выбирается в .env: AI_PROVIDER=claude | gemini | openai | off
-Если основной не ответил — пробуем запасные из FALLBACK_ORDER.
-Если не ответил никто — возвращаем None, и бот показывает отчёт
-без AI-комментария (но не падает).
+Если модель недоступна на тарифе VseGPT (HTTP 400) — провайдер
+помечается disabled на время жизни процесса и больше не вызывается.
 """
 
 import asyncio
@@ -23,39 +14,84 @@ import logging
 from backend.ai.ai_manager import AIManager
 from backend.ai.providers.vsegpt import VseGPTError
 
-# Импорт backend.config гарантирует, что .env уже загружен,
-# каким бы способом ни запустили проект.
-from backend.config import AI_ENABLED, AI_PROVIDER, AI_TIMEOUT
+from backend.config import (
+    AI_ENABLED,
+    AI_PROVIDER,
+    AI_TIMEOUT,
+    CLAUDE_ENABLED,
+    FALLBACK_MODEL,
+    PRIMARY_MODEL,
+)
 
 log = logging.getLogger("selleros.ai")
 
-#: Порядок запасных провайдеров, если основной не ответил.
+#: Порядок запасных провайдеров после PRIMARY/FALLBACK.
 FALLBACK_ORDER = ["claude", "openai", "gemini"]
 
 OFF_VALUES = ("off", "none", "disabled", "false", "0", "")
+
+#: Подстроки ошибок «модель недоступна» — sticky disable.
+_MODEL_UNAVAILABLE_MARKERS = (
+    "недоступна на вашем тарифе",
+    "not available on your subscription",
+    "не знает такую модель",
+    "no such model",
+    "model not found",
+)
 
 
 class AIService:
 
     def __init__(self, provider: str | None = None):
-        # provider передают только тесты. В обычной работе
-        # значение приходит из .env через backend.config.
         if provider is None:
-            self.provider_name = AI_PROVIDER
+            self.provider_name = PRIMARY_MODEL or AI_PROVIDER
             self.enabled = AI_ENABLED
         else:
             self.provider_name = provider.strip().lower()
             self.enabled = self.provider_name not in OFF_VALUES
 
         self.manager = AIManager(self.provider_name) if self.enabled else None
-
-        #: Последняя ошибка — чтобы test_ai мог показать причину.
         self.last_error: str | None = None
 
+        #: Провайдеры, которые больше не вызываем в этом процессе.
+        self._disabled: set[str] = set()
+        if not CLAUDE_ENABLED:
+            self._disabled.add("claude")
+            log.info("Claude отключён (CLAUDE_ENABLED=off)")
+
         if self.enabled:
-            log.info("Seller AI включён (провайдер: %s)", self.provider_name)
+            log.info(
+                "Seller AI включён (primary=%s, fallback=%s)",
+                PRIMARY_MODEL, FALLBACK_MODEL,
+            )
         else:
             log.info("Seller AI выключен — в .env указано AI_PROVIDER=off")
+
+    def disable_provider(self, name: str, reason: str = "") -> None:
+        """Sticky disable — следующий generate() не будет звонить в name."""
+        name = name.lower()
+        if name not in self._disabled:
+            self._disabled.add(name)
+            log.warning(
+                "AI provider %s отключён до перезапуска: %s",
+                name, reason or "unavailable",
+            )
+
+    def is_disabled(self, name: str) -> bool:
+        return name.lower() in self._disabled
+
+    def _provider_chain(self) -> list[str]:
+        """PRIMARY → FALLBACK → остальные, без disabled и дублей."""
+        ordered: list[str] = []
+        for name in (PRIMARY_MODEL, FALLBACK_MODEL, self.provider_name, *FALLBACK_ORDER):
+            n = (name or "").lower()
+            if not n or n in OFF_VALUES:
+                continue
+            if n in self._disabled:
+                continue
+            if n not in ordered:
+                ordered.append(n)
+        return ordered
 
     async def generate(
         self,
@@ -64,27 +100,19 @@ class AIService:
         system: str | None = None,
         history: list[dict] | None = None,
     ) -> str | None:
-        """
-        Главный метод. Возвращает текст ответа Seller AI
-        или None, если AI выключен либо все провайдеры недоступны.
-        """
-
         if not self.enabled:
             return None
 
         self.last_error = None
-
-        # Основной провайдер + запасные, без повторов.
-        chain = [self.provider_name] + [
-            name for name in FALLBACK_ORDER
-            if name != self.provider_name
-        ]
+        chain = self._provider_chain()
+        if not chain:
+            log.error("Нет доступных AI-провайдеров (все disabled)")
+            return None
 
         for name in chain:
             text = await self._try_provider(
                 name, prompt, system=system, history=history,
             )
-
             if text:
                 return text
 
@@ -92,10 +120,20 @@ class AIService:
         return None
 
     def _remember(self, message: str) -> None:
-        # Запоминаем ошибку ОСНОВНОГО провайдера: она интереснее всего.
-        # Ошибки запасных уходят в лог, но причину показываем первую.
         if self.last_error is None:
             self.last_error = message
+
+    def _should_disable(self, name: str, error: Exception) -> bool:
+        if name == "claude" and not CLAUDE_ENABLED:
+            return True
+        text = str(error).lower()
+        if isinstance(error, VseGPTError) and error.fatal:
+            if any(m in text for m in _MODEL_UNAVAILABLE_MARKERS):
+                return True
+            # Тариф/модель — disable; ключ/баланс тоже (повторять бессмысленно)
+            if "тариф" in text or "model" in text or "модел" in text:
+                return True
+        return any(m in text for m in _MODEL_UNAVAILABLE_MARKERS)
 
     async def _try_provider(
         self,
@@ -105,9 +143,10 @@ class AIService:
         system: str | None = None,
         history: list[dict] | None = None,
     ) -> str | None:
+        if self.is_disabled(name):
+            return None
+
         try:
-            # Таймаут на уровне HTTP уже стоит в провайдере;
-            # этот — страховка на случай зависания на нашей стороне.
             result = await asyncio.wait_for(
                 self.manager.analyze(
                     prompt, provider=name, system=system, history=history,
@@ -125,21 +164,23 @@ class AIService:
             return text
 
         except VseGPTError as error:
-            # Понятная ошибка VseGPT: ключ, баланс, тариф, лимит.
             self._remember(str(error))
             log.error("🔴 Seller AI (%s): %s", name, error)
+            if self._should_disable(name, error):
+                self.disable_provider(name, str(error))
 
         except asyncio.TimeoutError:
             self._remember(f"{name}: таймаут {AI_TIMEOUT} сек")
             log.warning("AI %s: таймаут %d сек", name, AI_TIMEOUT)
 
         except ValueError as error:
-            # Нет ключа / не задана модель / неизвестный провайдер.
             self._remember(f"{name}: {error}")
             log.warning("AI %s не настроен: %s", name, error)
 
         except Exception as error:
             self._remember(f"{name}: {type(error).__name__}: {error}")
             log.exception("AI %s: неожиданная ошибка", name)
+            if self._should_disable(name, error):
+                self.disable_provider(name, str(error))
 
         return None

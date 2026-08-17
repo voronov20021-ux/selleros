@@ -1,5 +1,7 @@
 import re
 
+from backend.api.miniapp_catalog import parse_article_input
+
 
 def parse_marketplace_link(link: str):
     """
@@ -10,18 +12,22 @@ def parse_marketplace_link(link: str):
         "Wildberries"
         "Ozon"
         None
+
+    Same nmID / WB URL pipeline as Mini App ``parse_article_input``.
     """
 
-    link = link.strip()
+    link = (link or "").strip()
+    if not link:
+        return None, None
 
-    # Wildberries
-    wb = re.search(r"/catalog/(\d+)", link)
-    if wb:
-        return "Wildberries", wb.group(1)
+    # Ozon before WB: ozon URLs end with -skuId
+    if "ozon" in link.lower():
+        ozon = re.search(r"-([0-9]+)/?$", link)
+        if ozon:
+            return "Ozon", ozon.group(1)
 
-    # Ozon
-    ozon = re.search(r"-([0-9]+)/?$", link)
-    if ozon:
-        return "Ozon", ozon.group(1)
+    article = parse_article_input(link)
+    if article:
+        return "Wildberries", str(article)
 
     return None, None

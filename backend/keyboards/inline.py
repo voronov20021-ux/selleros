@@ -7,9 +7,9 @@ callback_data — формат "раздел:действие":
     product:*  — действия с последним товаром
 """
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 
-from backend.config import AI_NAME
+from backend.config import AI_NAME, miniapp_product_url
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -49,18 +49,71 @@ def cancel_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def after_analysis_kb() -> InlineKeyboardMarkup:
-    """Кнопки под готовым анализом товара (этап 3, пункт 7)."""
+def after_analysis_kb(*, full_report_available: bool = True) -> InlineKeyboardMarkup:
+    """
+    Кнопки под готовым анализом товара.
+
+    full_report_available=False — после успешного полного отчёта/анализа,
+    чтобы не дублировать кнопку «Полный отчёт».
+
+    Advisor quick-actions — одна компактная строка (не раздуваем UI).
+    """
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🧠 Обсудить товар", callback_data="product:discuss")],
+        [
+            InlineKeyboardButton(text="🔧 Как исправить", callback_data="advisor:fix"),
+            InlineKeyboardButton(text="🚀 Как вырасти", callback_data="advisor:grow"),
+        ],
+    ]
+    actions: list[InlineKeyboardButton] = []
+    if full_report_available:
+        actions.append(
+            InlineKeyboardButton(text="📊 Полный отчёт", callback_data="product:full"),
+        )
+    actions.append(
+        InlineKeyboardButton(text="🔄 Новый анализ", callback_data="menu:analyze"),
+    )
+    rows.append(actions)
+    rows.append(
+        [InlineKeyboardButton(text="📦 Мои товары", callback_data="menu:products")],
+    )
+    rows.append(
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main")],
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def after_full_report_kb() -> InlineKeyboardMarkup:
+    """После показа «Полный отчёт» — без повторной кнопки отчёта."""
+    return after_analysis_kb(full_report_available=False)
+
+
+def action_verification_kb(action_id: str) -> InlineKeyboardMarkup:
+    """Seller confirmation when API/parser cannot prove application."""
+    aid = str(action_id)[:36]
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🧠 Обсудить товар", callback_data="product:discuss"),
+            InlineKeyboardButton(text="✅ Да, поменял", callback_data=f"actv:yes:{aid}"),
+            InlineKeyboardButton(text="❌ Нет", callback_data=f"actv:no:{aid}"),
         ],
         [
-            InlineKeyboardButton(text="📊 Полный отчёт", callback_data="product:full"),
-            InlineKeyboardButton(text="🔄 Новый анализ", callback_data="menu:analyze"),
+            InlineKeyboardButton(text="⏳ Проверить позже", callback_data=f"actv:later:{aid}"),
+            InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data=f"actv:again:{aid}"),
+        ],
+    ])
+
+
+def action_recommend_kb(action_id: str) -> InlineKeyboardMarkup:
+    """Accept / done / defer for a proposed recommendation."""
+    aid = str(action_id)[:36]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"actv:accept:{aid}"),
+            InlineKeyboardButton(text="🛠 Сделал", callback_data=f"actv:done:{aid}"),
         ],
         [
-            InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main"),
+            InlineKeyboardButton(text="🔍 Проверить", callback_data=f"actv:check:{aid}"),
+            InlineKeyboardButton(text="⏳ Отложить", callback_data=f"actv:later:{aid}"),
         ],
     ])
 
@@ -85,8 +138,99 @@ def reports_kb() -> InlineKeyboardMarkup:
 def discuss_kb() -> InlineKeyboardMarkup:
     """Показывается в режиме диалога о товаре."""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔎 Подробнее", callback_data="advisor:detail"),
+            InlineKeyboardButton(text="➕ Что добавить", callback_data="advisor:add"),
+        ],
         [InlineKeyboardButton(text="✅ Закончить диалог", callback_data="product:discuss_end")],
     ])
+
+
+def solution_after_rec_kb() -> InlineKeyboardMarkup:
+    """После рекомендации / проблемы: найти варианты / сравнить / обсудить."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Найти варианты", callback_data="solution:find"),
+            InlineKeyboardButton(text="Сравнить", callback_data="solution:compare"),
+        ],
+        [
+            InlineKeyboardButton(text="Обсудить", callback_data="product:discuss"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Закончить диалог", callback_data="product:discuss_end"),
+        ],
+    ])
+
+
+def solution_options_kb(labels: list[str] | None = None) -> InlineKeyboardMarkup:
+    """После вариантов: [1][2][3]."""
+    labs = labels or ["1", "2", "3"]
+    row = [
+        InlineKeyboardButton(
+            text=str(lab),
+            callback_data=f"solution:pick:{i+1}",
+        )
+        for i, lab in enumerate(labs[:5])
+    ]
+    rows = [row] if row else []
+    rows.append([
+        InlineKeyboardButton(text="Сравнить", callback_data="solution:compare"),
+        InlineKeyboardButton(text="Обсудить", callback_data="product:discuss"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="✅ Закончить диалог", callback_data="product:discuss_end"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def solution_after_pick_kb() -> InlineKeyboardMarkup:
+    """После выбора варианта: Выбрать / Назад / Обсудить."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Выбрать", callback_data="solution:confirm"),
+            InlineKeyboardButton(text="Назад", callback_data="solution:back"),
+        ],
+        [
+            InlineKeyboardButton(text="Обсудить", callback_data="product:discuss"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Закончить диалог", callback_data="product:discuss_end"),
+        ],
+    ])
+
+
+def solution_after_recorded_kb() -> InlineKeyboardMarkup:
+    """После записи решения."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Записать решение", callback_data="solution:record"),
+            InlineKeyboardButton(text="Обсудить дальше", callback_data="product:discuss"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Закончить диалог", callback_data="product:discuss_end"),
+        ],
+    ])
+
+
+def keyboard_for_solution_stage(
+    stage: str | None,
+    *,
+    option_labels: list[str] | None = None,
+    full_report_shown: bool = False,
+) -> InlineKeyboardMarkup:
+    """
+    Minimal stage keyboard. Never duplicates product:full after full report.
+    """
+    if stage == "after_options":
+        return solution_options_kb(option_labels)
+    if stage == "after_pick":
+        return solution_after_pick_kb()
+    if stage == "after_recorded":
+        return solution_after_recorded_kb()
+    if stage == "after_rec":
+        return solution_after_rec_kb()
+    # default discuss — no product:full here
+    return discuss_kb()
 
 
 def discuss_entry_kb() -> InlineKeyboardMarkup:
@@ -130,12 +274,26 @@ def products_list_kb(products) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def product_added_kb() -> InlineKeyboardMarkup:
-    """После «✅ Товар добавлен» — выбор между предварительным и точным анализом."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Предварительный анализ", callback_data="product:prelim")],
-        [InlineKeyboardButton(text="📊 Точный анализ", callback_data="product:precise")],
-    ])
+def product_added_kb(article: int | None = None) -> InlineKeyboardMarkup:
+    """Короткий Telegram-разбор: Mini App с nmID, иначе локальные шаги."""
+    rows: list[list[InlineKeyboardButton]] = []
+    url = miniapp_product_url(article)
+    if url:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📱 Открыть полный разбор в Seller OS",
+                    web_app=WebAppInfo(url=url),
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="🤖 Короткий разбор здесь", callback_data="product:prelim")],
+            [InlineKeyboardButton(text="📊 Точный анализ", callback_data="product:precise")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def after_preliminary_kb() -> InlineKeyboardMarkup:
@@ -152,26 +310,46 @@ def after_preliminary_kb() -> InlineKeyboardMarkup:
 
 
 def precise_data_kb() -> InlineKeyboardMarkup:
-    """Данных продавца ещё нет — предлагаем ввести вручную или подключить API."""
+    """Публичная коммерция неполная — ввод только недостающих CARD-полей."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Ввести данные", callback_data="product:manual_input")],
+        [InlineKeyboardButton(text="✏️ Ввести недостающие данные", callback_data="product:manual_input")],
         [InlineKeyboardButton(text="🔑 Подключить свой API", callback_data="product:connect_api")],
     ])
 
 
 def precise_data_ready_kb() -> InlineKeyboardMarkup:
-    """Данные продавца уже есть — можно обновить их или запросить полный анализ."""
+    """
+    Публичные price/rating/feedbacks уже есть (CARD DATA) — полный анализ доступен.
+    «Добавить данные продавца» = только private metrics (CTR/CVR/sales/...),
+    без повторного запроса цены/рейтинга/отзывов карточки.
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить данные", callback_data="product:manual_input")],
         [InlineKeyboardButton(text="📈 Получить полный анализ", callback_data="product:full_analysis")],
+        [InlineKeyboardButton(text="➕ Добавить данные продавца", callback_data="product:seller_metrics")],
+        [InlineKeyboardButton(text="🔑 Подключить свой API", callback_data="product:connect_api")],
+    ])
+
+
+def precise_data_stale_seller_kb() -> InlineKeyboardMarkup:
+    """
+    В памяти есть SellerData по артикулу, но он не подтверждён для текущего анализа.
+    Не авто-подставляем — предлагаем использовать / обновить / идти в анализ.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 Получить полный анализ", callback_data="product:full_analysis")],
+        [InlineKeyboardButton(
+            text="✅ Использовать сохранённые данные продавца",
+            callback_data="product:confirm_seller",
+        )],
+        [InlineKeyboardButton(text="🔄 Обновить данные продавца", callback_data="product:seller_metrics")],
         [InlineKeyboardButton(text="🔑 Подключить свой API", callback_data="product:connect_api")],
     ])
 
 
 def manual_input_skip_kb() -> InlineKeyboardMarkup:
-    """После обязательных полей (цена/рейтинг/отзывы) — доп. данные необязательны."""
+    """После gap-fill — private metrics необязательны."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Добавить продажи", callback_data="manual:extra_add")],
+        [InlineKeyboardButton(text="➕ Добавить данные продавца", callback_data="manual:extra_add")],
         [InlineKeyboardButton(text="⏭ Пропустить", callback_data="manual:extra_skip")],
     ])
 

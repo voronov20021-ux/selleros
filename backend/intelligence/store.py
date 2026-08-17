@@ -16,11 +16,22 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 import aiosqlite
 
 from backend.intelligence.interfaces import IIntelligenceStore
+from backend.intelligence.learning import (
+    ActionOutcome,
+    LearningSignal,
+    LearningSignalType,
+    OutcomeDirection,
+)
+from backend.intelligence.outcomes import (
+    RecommendationOutcome,
+    OutcomeDirection as RecOutcomeDirection,
+)
 from backend.intelligence.models import (
     ChangeType,
     DataSource,
@@ -31,6 +42,11 @@ from backend.intelligence.models import (
     ItemType,
     KnowledgeItem,
     MarketEvent,
+    ReviewAssessment,
+    ReviewIssue,
+    ReviewSentiment,
+    ReviewSignal,
+    ReviewSignalType,
     SeasonalityRecord,
     SellerObservation,
     SourceType,
@@ -613,6 +629,59 @@ class IntelligenceStore(IIntelligenceStore):
             for r in rows
         ]
 
+    # ──────────────────────────── api call tracking ─────────────────────── #
+
+    async def record_api_call(
+        self,
+        call_id: str,
+        source_id: str,
+        query: str | None,
+        category: str | None,
+        region: str | None,
+        called_at: float,
+    ) -> None:
+        await self.db.execute(
+            "INSERT OR IGNORE INTO api_calls (id, source_id, query, category, region, called_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (call_id, source_id, query, category, region, called_at),
+        )
+        await self.db.commit()
+
+    async def count_api_calls(self, source_id: str, since_ts: float) -> int:
+        cursor = await self.db.execute(
+            "SELECT COUNT(*) FROM api_calls WHERE source_id = ? AND called_at >= ?",
+            (source_id, since_ts),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def search_items_by_query(
+        self,
+        query: str,
+        source_id: str | None = None,
+        since_ts: float | None = None,
+        limit: int = 50,
+    ) -> list[KnowledgeItem]:
+        conditions = ["json_extract(metadata, '$.query') = ?"]
+        params: list = [query]
+        if source_id is not None:
+            conditions.append("source_id = ?")
+            params.append(source_id)
+        if since_ts is not None:
+            conditions.append("collected_at >= ?")
+            params.append(since_ts)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        cursor = await self.db.execute(
+            f"SELECT id, source_id, source_url, collected_at, published_at, "
+            f"item_type, category, region, period, confidence, content, metadata "
+            f"FROM knowledge_items WHERE {where} "
+            f"ORDER BY collected_at DESC LIMIT ?",
+            tuple(params),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_item(r) for r in rows]
+
     # ──────────────────────────────── market events ─────────────────────── #
 
     async def save_market_event(self, event: MarketEvent) -> None:
@@ -690,3 +759,517 @@ class IntelligenceStore(IIntelligenceStore):
             )
             for r in rows
         ]
+
+    # ──────────────────────────────── learning loop ─────────────────────── #
+
+    async def save_action_outcome(self, outcome: ActionOutcome) -> None:
+        await self.db.execute(
+            """
+            INSERT OR REPLACE INTO action_outcomes
+                (id, user_hash, category, article, recommendation_type, action,
+                 period_start, period_end, created_at,
+                 metrics_before, metrics_after, outcome_direction, outcome_score,
+                 confidence, evidence_ids, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outcome.id,
+                outcome.user_hash,
+                outcome.category,
+                outcome.article,
+                outcome.recommendation_type,
+                outcome.action,
+                outcome.period_start,
+                outcome.period_end,
+                outcome.created_at,
+                self._j(outcome.metrics_before),
+                self._j(outcome.metrics_after),
+                outcome.outcome_direction.value,
+                outcome.outcome_score,
+                outcome.confidence,
+                self._j(outcome.evidence_ids),
+                self._j(outcome.metadata),
+            ),
+        )
+        await self.db.commit()
+
+    async def get_action_outcome(self, outcome_id: str) -> ActionOutcome | None:
+        cursor = await self.db.execute(
+            "SELECT id, user_hash, category, article, recommendation_type, action, "
+            "period_start, period_end, created_at, metrics_before, metrics_after, "
+            "outcome_direction, outcome_score, confidence, evidence_ids, metadata "
+            "FROM action_outcomes WHERE id = ?",
+            (outcome_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_outcome(row) if row else None
+
+    async def search_action_outcomes(
+        self,
+        *,
+        category: str | None = None,
+        action: str | None = None,
+        user_hash: str | None = None,
+        since_ts: float | None = None,
+        limit: int = 100,
+    ) -> list[ActionOutcome]:
+        conditions = ["1=1"]
+        params: list = []
+        if category is not None:
+            conditions.append("category = ?")
+            params.append(category)
+        if action is not None:
+            conditions.append("action = ?")
+            params.append(action)
+        if user_hash is not None:
+            conditions.append("user_hash = ?")
+            params.append(user_hash)
+        if since_ts is not None:
+            conditions.append("period_end >= ?")
+            params.append(since_ts)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        cursor = await self.db.execute(
+            f"SELECT id, user_hash, category, article, recommendation_type, action, "
+            f"period_start, period_end, created_at, metrics_before, metrics_after, "
+            f"outcome_direction, outcome_score, confidence, evidence_ids, metadata "
+            f"FROM action_outcomes WHERE {where} "
+            f"ORDER BY period_end DESC LIMIT ?",
+            tuple(params),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_outcome(r) for r in rows]
+
+    async def save_learning_signal(self, signal: LearningSignal) -> None:
+        await self.db.execute(
+            """
+            INSERT OR REPLACE INTO learning_signals
+                (id, outcome_id, signal_type, claim, confidence,
+                 evidence_ids, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal.id,
+                signal.outcome_id,
+                signal.signal_type.value,
+                signal.claim,
+                signal.confidence,
+                self._j(signal.evidence_ids),
+                self._j(signal.metadata),
+                signal.created_at,
+            ),
+        )
+        await self.db.commit()
+
+    async def search_learning_signals(
+        self,
+        *,
+        outcome_id: str | None = None,
+        signal_type: str | None = None,
+        limit: int = 100,
+    ) -> list[LearningSignal]:
+        conditions = ["1=1"]
+        params: list = []
+        if outcome_id is not None:
+            conditions.append("outcome_id = ?")
+            params.append(outcome_id)
+        if signal_type is not None:
+            conditions.append("signal_type = ?")
+            params.append(signal_type)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        cursor = await self.db.execute(
+            f"SELECT id, outcome_id, signal_type, claim, confidence, "
+            f"evidence_ids, metadata, created_at "
+            f"FROM learning_signals WHERE {where} "
+            f"ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_learning_signal(r) for r in rows]
+
+    async def find_learning_signal_by_source_outcome(
+        self,
+        source_outcome_id: str,
+    ) -> LearningSignal | None:
+        cursor = await self.db.execute(
+            "SELECT id, outcome_id, signal_type, claim, confidence, "
+            "evidence_ids, metadata, created_at "
+            "FROM learning_signals "
+            "WHERE json_extract(metadata, '$.source_outcome_id') = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (source_outcome_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_learning_signal(row) if row else None
+
+    def _row_to_outcome(self, row) -> ActionOutcome:
+        return ActionOutcome(
+            id=row[0],
+            user_hash=row[1],
+            category=row[2],
+            article=row[3],
+            recommendation_type=row[4],
+            action=row[5],
+            period_start=row[6],
+            period_end=row[7],
+            created_at=row[8],
+            metrics_before=self._pj(row[9], {}),
+            metrics_after=self._pj(row[10], {}),
+            outcome_direction=OutcomeDirection(row[11]) if row[11] else OutcomeDirection.UNKNOWN,
+            outcome_score=row[12],
+            confidence=row[13],
+            evidence_ids=self._pj(row[14], []),
+            metadata=self._pj(row[15], {}),
+        )
+
+    def _row_to_learning_signal(self, row) -> LearningSignal:
+        return LearningSignal(
+            id=row[0],
+            outcome_id=row[1],
+            signal_type=LearningSignalType(row[2]),
+            claim=row[3],
+            confidence=row[4],
+            evidence_ids=self._pj(row[5], []),
+            metadata=self._pj(row[6], {}),
+            created_at=row[7],
+        )
+
+    # ──────────────────────── recommendation outcomes ───────────────────── #
+
+    async def save_recommendation_outcome(
+        self, outcome: RecommendationOutcome,
+    ) -> None:
+        await self.db.execute(
+            """
+            INSERT OR REPLACE INTO recommendation_outcomes
+                (id, user_hash, category, article, recommendation_type,
+                 recommendation_action, recommendation_confidence, recommended_at,
+                 action_taken, action_taken_at, period_start, period_end,
+                 metrics_before, metrics_after, outcome_direction, outcome_score,
+                 confidence, evidence_ids, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outcome.id,
+                outcome.user_hash,
+                outcome.category,
+                outcome.article,
+                outcome.recommendation_type,
+                outcome.recommendation_action,
+                outcome.recommendation_confidence,
+                outcome.recommended_at,
+                outcome.action_taken,
+                outcome.action_taken_at,
+                outcome.period_start,
+                outcome.period_end,
+                self._j(outcome.metrics_before),
+                self._j(outcome.metrics_after),
+                outcome.outcome_direction.value,
+                outcome.outcome_score,
+                outcome.confidence,
+                self._j(outcome.evidence_ids),
+                self._j(outcome.metadata),
+            ),
+        )
+        await self.db.commit()
+
+    async def get_recommendation_outcome(
+        self, outcome_id: str,
+    ) -> RecommendationOutcome | None:
+        cursor = await self.db.execute(
+            "SELECT id, user_hash, category, article, recommendation_type, "
+            "recommendation_action, recommendation_confidence, recommended_at, "
+            "action_taken, action_taken_at, period_start, period_end, "
+            "metrics_before, metrics_after, outcome_direction, outcome_score, "
+            "confidence, evidence_ids, metadata "
+            "FROM recommendation_outcomes WHERE id = ?",
+            (outcome_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_rec_outcome(row) if row else None
+
+    async def search_recommendation_outcomes(
+        self,
+        *,
+        category: str | None = None,
+        article: str | None = None,
+        recommendation_type: str | None = None,
+        outcome_direction: str | None = None,
+        days: int | None = 90,
+        limit: int = 100,
+    ) -> list[RecommendationOutcome]:
+        import time as _time
+        conditions = ["1=1"]
+        params: list = []
+        if category is not None:
+            conditions.append("category = ?")
+            params.append(category)
+        if article is not None:
+            conditions.append("article = ?")
+            params.append(article)
+        if recommendation_type is not None:
+            conditions.append("recommendation_type = ?")
+            params.append(recommendation_type)
+        if outcome_direction is not None:
+            conditions.append("outcome_direction = ?")
+            params.append(outcome_direction)
+        if days is not None and days > 0:
+            conditions.append("recommended_at >= ?")
+            params.append(_time.time() - days * 86400)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        cursor = await self.db.execute(
+            f"SELECT id, user_hash, category, article, recommendation_type, "
+            f"recommendation_action, recommendation_confidence, recommended_at, "
+            f"action_taken, action_taken_at, period_start, period_end, "
+            f"metrics_before, metrics_after, outcome_direction, outcome_score, "
+            f"confidence, evidence_ids, metadata "
+            f"FROM recommendation_outcomes WHERE {where} "
+            f"ORDER BY recommended_at DESC LIMIT ?",
+            tuple(params),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_rec_outcome(r) for r in rows]
+
+    def _row_to_rec_outcome(self, row) -> RecommendationOutcome:
+        return RecommendationOutcome(
+            id=row[0],
+            user_hash=row[1],
+            category=row[2],
+            article=row[3],
+            recommendation_type=row[4],
+            recommendation_action=row[5],
+            recommendation_confidence=row[6],
+            recommended_at=row[7],
+            action_taken=row[8],
+            action_taken_at=row[9],
+            period_start=row[10],
+            period_end=row[11],
+            metrics_before=self._pj(row[12], {}),
+            metrics_after=self._pj(row[13], {}),
+            outcome_direction=(
+                RecOutcomeDirection(row[14]) if row[14]
+                else RecOutcomeDirection.UNKNOWN
+            ),
+            outcome_score=row[15],
+            confidence=row[16],
+            evidence_ids=self._pj(row[17], []),
+            metadata=self._pj(row[18], {}),
+        )
+
+    # ──────────────────────────────── review intelligence ───────────────── #
+
+    async def save_review_signal(self, signal: ReviewSignal) -> None:
+        await self.db.execute(
+            """
+            INSERT OR REPLACE INTO review_signals
+                (id, user_hash, article, category, signal_type, sentiment, claim,
+                 confidence, source_ids, source_url, review_id, created_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal.id,
+                signal.user_hash or "",
+                signal.article,
+                signal.category,
+                signal.signal_type.value,
+                signal.sentiment.value,
+                signal.claim,
+                signal.confidence,
+                self._j(signal.source_ids),
+                signal.source_url,
+                signal.review_id,
+                signal.created_at,
+                self._j(signal.metadata),
+            ),
+        )
+        await self.db.commit()
+
+    async def save_review_issue(self, issue: ReviewIssue) -> None:
+        await self.db.execute(
+            """
+            INSERT OR REPLACE INTO review_issues
+                (id, user_hash, article, category, signal_type, sentiment, claim,
+                 count, ratio, confidence, source_ids, created_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                issue.id,
+                issue.user_hash or "",
+                issue.article,
+                issue.category,
+                issue.signal_type.value,
+                issue.sentiment.value,
+                issue.claim,
+                issue.count,
+                issue.ratio,
+                issue.confidence,
+                self._j(issue.source_ids),
+                issue.created_at,
+                self._j(issue.metadata),
+            ),
+        )
+        await self.db.commit()
+
+    async def search_review_signals(
+        self,
+        *,
+        user_hash: str | None = None,
+        category: str | None = None,
+        article: str | None = None,
+        signal_type: str | None = None,
+        since_ts: float | None = None,
+        limit: int = 100,
+    ) -> list[ReviewSignal]:
+        conditions = ["1=1"]
+        params: list = []
+        if user_hash is not None:
+            conditions.append("user_hash = ?")
+            params.append(user_hash)
+        if category is not None:
+            conditions.append("category = ?")
+            params.append(category)
+        if article is not None:
+            conditions.append("article = ?")
+            params.append(article)
+        if signal_type is not None:
+            conditions.append("signal_type = ?")
+            params.append(signal_type)
+        if since_ts is not None:
+            conditions.append("created_at >= ?")
+            params.append(since_ts)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        cursor = await self.db.execute(
+            f"SELECT id, user_hash, article, category, signal_type, sentiment, claim, "
+            f"confidence, source_ids, source_url, review_id, created_at, metadata "
+            f"FROM review_signals WHERE {where} "
+            f"ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_review_signal(r) for r in rows]
+
+    async def search_review_issues(
+        self,
+        *,
+        user_hash: str | None = None,
+        category: str | None = None,
+        article: str | None = None,
+        signal_type: str | None = None,
+        sentiment: str | None = None,
+        min_count: int = 1,
+        limit: int = 50,
+    ) -> list[ReviewIssue]:
+        conditions = ["count >= ?"]
+        params: list = [min_count]
+        if user_hash is not None:
+            conditions.append("user_hash = ?")
+            params.append(user_hash)
+        if category is not None:
+            conditions.append("category = ?")
+            params.append(category)
+        if article is not None:
+            conditions.append("article = ?")
+            params.append(article)
+        if signal_type is not None:
+            conditions.append("signal_type = ?")
+            params.append(signal_type)
+        if sentiment is not None:
+            conditions.append("sentiment = ?")
+            params.append(sentiment)
+        params.append(limit)
+        where = " AND ".join(conditions)
+        cursor = await self.db.execute(
+            f"SELECT id, user_hash, article, category, signal_type, sentiment, claim, "
+            f"count, ratio, confidence, source_ids, created_at, metadata "
+            f"FROM review_issues WHERE {where} "
+            f"ORDER BY count DESC, confidence DESC LIMIT ?",
+            tuple(params),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_review_issue(r) for r in rows]
+
+    async def get_review_assessment(
+        self,
+        *,
+        user_hash: str,
+        category: str | None = None,
+        article: str | None = None,
+        days: int = 30,
+    ) -> ReviewAssessment | None:
+        since = time.time() - days * 86400 if days > 0 else None
+        signals = await self.search_review_signals(
+            user_hash=user_hash,
+            category=category,
+            article=article,
+            since_ts=since,
+            limit=200,
+        )
+        issues = await self.search_review_issues(
+            user_hash=user_hash,
+            category=category,
+            article=article,
+            min_count=1,
+            limit=50,
+        )
+        if not signals and not issues:
+            return None
+        conf = 0.0
+        if issues:
+            conf = sum(i.confidence for i in issues) / len(issues)
+        elif signals:
+            conf = sum(s.confidence for s in signals) / len(signals)
+        from backend.intelligence.reviews import (
+            build_seller_actions,
+            build_seller_problems,
+        )
+        problems = build_seller_problems(issues, signals)
+        actions = build_seller_actions(problems)
+        return ReviewAssessment(
+            category=category,
+            article=article,
+            user_hash=user_hash,
+            processed_count=len(signals),
+            signals=signals,
+            issues=issues,
+            problems=problems,
+            actions=actions,
+            confidence=round(min(0.90, conf), 4),
+            generated_at=time.time(),
+        )
+
+    def _row_to_review_signal(self, row) -> ReviewSignal:
+        return ReviewSignal(
+            id=row[0],
+            user_hash=row[1] or None,
+            article=row[2],
+            category=row[3],
+            signal_type=ReviewSignalType(row[4]),
+            sentiment=ReviewSentiment(row[5]),
+            claim=row[6],
+            confidence=row[7],
+            source_ids=self._pj(row[8], []),
+            source_url=row[9],
+            review_id=row[10],
+            created_at=row[11],
+            metadata=self._pj(row[12], {}),
+        )
+
+    def _row_to_review_issue(self, row) -> ReviewIssue:
+        return ReviewIssue(
+            id=row[0],
+            user_hash=row[1] or None,
+            article=row[2],
+            category=row[3],
+            signal_type=ReviewSignalType(row[4]),
+            sentiment=ReviewSentiment(row[5]),
+            claim=row[6],
+            count=row[7],
+            ratio=row[8],
+            confidence=row[9],
+            source_ids=self._pj(row[10], []),
+            created_at=row[11],
+            metadata=self._pj(row[12], {}),
+        )

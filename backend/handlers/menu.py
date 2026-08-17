@@ -66,10 +66,12 @@ async def show_analyze(callback: CallbackQuery, state: FSMContext):
         callback,
         "📦 <b>Анализ товара</b>\n"
         "\n"
-        "Пришлите ссылку на карточку Wildberries.\n"
+        "Пришлите артикул WB или ссылку на товар — я разберу его.\n"
         "\n"
         "Например:\n"
-        "<code>https://www.wildberries.ru/catalog/211246754/detail.aspx</code>",
+        "<code>357657814</code>\n"
+        "или\n"
+        "<code>https://www.wildberries.ru/catalog/357657814/detail.aspx</code>",
         cancel_kb(),
     )
 
@@ -84,15 +86,8 @@ async def show_seller_ai(callback: CallbackQuery, state: FSMContext):
         callback,
         f"🧠 <b>{AI_NAME}</b>\n"
         "\n"
-        "Ваш личный эксперт по маркетплейсам.\n"
-        "\n"
-        "Задайте любой вопрос о продажах:\n"
-        "\n"
-        "<i>— Как поднять карточку в поиске?\n"
-        "— Какую скидку ставить на старте?\n"
-        "— Как отвечать на негативные отзывы?</i>\n"
-        "\n"
-        "Просто напишите вопрос сообщением 👇",
+        "Пришлите артикул WB или ссылку на товар — я разберу его.\n"
+        "Можно и вопрос текстом — если товар уже в контексте, отвечу по нему.",
         cancel_kb(),
     )
 
