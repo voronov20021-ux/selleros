@@ -300,12 +300,16 @@ class MemoryStore:
     async def connect(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._db = await aiosqlite.connect(self.db_path)
+        self._db = await aiosqlite.connect(self.db_path, timeout=30)
 
         # WAL — чтение и запись не блокируют друг друга.
         # Для бота, где одни хендлеры читают, а другие пишут
         # одновременно, это важно даже на SQLite.
+        # timeout/busy_timeout: API SessionStore и бот делят один файл;
+        # без ожидания второй writer сразу получает "database is locked".
         await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA busy_timeout=30000")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(SCHEMA)
         await self._db.commit()
 
