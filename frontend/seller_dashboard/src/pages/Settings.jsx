@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import BackLink from "../components/BackLink";
 import { ErrorState } from "../components/ScreenState";
 import { resetTour } from "../components/SpotlightTour";
 import {
@@ -129,6 +130,7 @@ export default function Settings() {
 
   return (
     <div>
+      <BackLink to="/more" />
       <div className="brand-row">
         <div className="brand">
           <strong>Настройки</strong>

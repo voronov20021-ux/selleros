@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
+import BackLink from "../components/BackLink";
 import FirstScreen, { MarketBlock, UnitBlock } from "../components/FirstScreen";
 import ActionLoop from "../components/ActionLoop";
 import ProductImage from "../components/ProductImage";
@@ -79,16 +80,33 @@ export default function ProductDetail() {
     }
   }
 
-  if (loading) return <Skeleton rows={4} />;
-  if (error) return <ErrorState text={error} onRetry={reload} />;
+  if (loading) {
+    return (
+      <div>
+        <BackLink to="/products" />
+        <Skeleton rows={4} />
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div>
+        <BackLink to="/products" />
+        <ErrorState text={error} onRetry={reload} />
+      </div>
+    );
+  }
   if (!data || (data.demo && !data.owned && !data.first_screen)) {
     return (
-      <EmptyState
-        title="Этого товара нет в вашем магазине"
-        text="Не показываем demo-каталог как ваш SKU."
-        to="/products"
-        action="Добавить товар"
-      />
+      <div>
+        <BackLink to="/products" />
+        <EmptyState
+          title="Этого товара нет в вашем магазине"
+          text="Не показываем demo-каталог как ваш SKU."
+          to="/products"
+          action="Добавить товар"
+        />
+      </div>
     );
   }
 
@@ -99,14 +117,10 @@ export default function ProductDetail() {
 
   return (
     <div>
+      <BackLink to="/products" />
       <div className="brand-row">
         <div className="brand">
-          <Link to="/products" className="muted">
-            ← Товары
-          </Link>
-          <strong style={{ marginTop: 4 }}>
-            {owned ? "Что с этим товаром" : "Быстрый разбор"}
-          </strong>
+          <strong>{owned ? "Что с этим товаром" : "Быстрый разбор"}</strong>
         </div>
       </div>
 

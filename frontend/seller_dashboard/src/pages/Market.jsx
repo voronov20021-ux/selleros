@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import BackLink from "../components/BackLink";
 import { EmptyState, ErrorState, Skeleton } from "../components/ScreenState";
 import { MarketBlock } from "../components/FirstScreen";
 import { analyzePublic, fetchProduct, getStickyArticle } from "../api";
@@ -68,10 +69,18 @@ export default function Market() {
     }
   }
 
-  if (loading) return <Skeleton rows={3} />;
+  if (loading) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <Skeleton rows={3} />
+      </div>
+    );
+  }
 
   return (
     <div>
+      <BackLink to="/more" />
       <div className="brand-row">
         <div className="brand">
           <strong>Рынок</strong>

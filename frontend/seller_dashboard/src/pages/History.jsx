@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import BackLink from "../components/BackLink";
 import { EmptyState, ErrorState, Skeleton } from "../components/ScreenState";
 import { fetchActionHistory } from "../api";
 import { formatWhen, humanAction, humanVerify } from "../labels";
@@ -25,11 +26,26 @@ export default function History() {
     reload();
   }, [reload]);
 
-  if (loading) return <Skeleton rows={3} />;
-  if (error) return <ErrorState text={error} onRetry={reload} />;
+  if (loading) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <Skeleton rows={3} />
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <ErrorState text={error} onRetry={reload} />
+      </div>
+    );
+  }
 
   return (
     <div>
+      <BackLink to="/more" />
       <div className="brand-row">
         <div className="brand">
           <strong>История</strong>

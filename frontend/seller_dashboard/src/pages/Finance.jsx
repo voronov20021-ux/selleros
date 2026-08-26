@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import BackLink from "../components/BackLink";
 import { EmptyState, ErrorState, Skeleton } from "../components/ScreenState";
 import { UnitBlock } from "../components/FirstScreen";
 import { fetchFinance, getStickyArticle } from "../api";
@@ -55,14 +56,29 @@ export default function Finance() {
     [products, article]
   );
 
-  if (loading) return <Skeleton rows={3} />;
-  if (error) return <ErrorState text={error} />;
+  if (loading) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <Skeleton rows={3} />
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <ErrorState text={error} />
+      </div>
+    );
+  }
 
   const lines = data?.lines || [];
   const tariffs = data?.tariffs || {};
 
   return (
     <div>
+      <BackLink to="/more" />
       <div className="brand-row">
         <div className="brand">
           <strong>Деньги</strong>

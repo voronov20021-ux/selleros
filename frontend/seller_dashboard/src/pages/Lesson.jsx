@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import BackLink from "../components/BackLink";
 import { completeMission, evaluateFormulaLesson, fetchFormulaLesson } from "../api";
 import { EmptyState, ErrorState, Skeleton } from "../components/ScreenState";
 import { humanFormula } from "../labels";
@@ -47,12 +48,34 @@ export default function Lesson() {
     }
   }
 
-  if (loading) return <Skeleton rows={2} />;
-  if (error) return <ErrorState text={error} />;
-  if (!lesson) return <EmptyState title="Урок недоступен" />;
+  if (loading) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <Skeleton rows={2} />
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <ErrorState text={error} />
+      </div>
+    );
+  }
+  if (!lesson) {
+    return (
+      <div>
+        <BackLink to="/more" />
+        <EmptyState title="Урок недоступен" />
+      </div>
+    );
+  }
 
   return (
     <div data-mission="ctr_lesson">
+      <BackLink to="/more" />
       <div className="brand-row">
         <div className="brand">
           <strong>{lesson.title}</strong>

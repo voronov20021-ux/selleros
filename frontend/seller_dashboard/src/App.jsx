@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import Products from "./pages/Products";
 import ProductDetail from "./pages/ProductDetail";
@@ -12,21 +12,22 @@ import Actions from "./pages/Actions";
 import History from "./pages/History";
 import More from "./pages/More";
 import SpotlightTour from "./components/SpotlightTour";
+import { trackRoute } from "./components/BackLink";
 import { AuthWall, Skeleton } from "./components/ScreenState";
 import { bootstrapTelegramAuth, fetchAssistantContext, getAuthState, setStickyArticle } from "./api";
-import { isDevPreviewSeller, isTelegramWebApp, isViteDev, parseWbArticle } from "./catalog";
+import { isDevPreviewSeller, isTelegramWebApp, isViteDev } from "./catalog";
+import { readLaunchArticle } from "./launchRoute";
 
 const MORE_PREFIXES = ["/more", "/finance", "/market", "/actions", "/history", "/settings", "/lesson"];
 
-function readLaunchArticle() {
-  const search = new URLSearchParams(window.location.search);
-  const fromQuery = parseWbArticle(search.get("article") || "");
-  const tg = window.Telegram?.WebApp?.initDataUnsafe;
-  const fromStart = parseWbArticle(tg?.start_param || "");
-  const hash = String(window.location.hash || "");
-  const hashNm = hash.match(/\/products\/(\d{4,})/);
-  const fromHash = hashNm ? Number(hashNm[1]) : null;
-  return fromHash || fromStart || fromQuery || null;
+let firstOpenSettled = false;
+
+function scrollAppToTop() {
+  window.scrollTo(0, 0);
+  document.documentElement.scrollTop = 0;
+  document.body.scrollTop = 0;
+  const shell = document.querySelector(".app-shell");
+  if (shell) shell.scrollTop = 0;
 }
 
 export default function App() {
@@ -39,6 +40,20 @@ export default function App() {
   const moreActive = MORE_PREFIXES.some(
     (p) => location.pathname === p || location.pathname.startsWith(`${p}/`)
   );
+
+  useEffect(() => {
+    trackRoute(location.pathname);
+    scrollAppToTop();
+  }, [location.pathname, location.hash]);
+
+  useEffect(() => {
+    if (firstOpenSettled) return;
+    firstOpenSettled = true;
+    if (readLaunchArticle()) return;
+    if (location.pathname !== "/") {
+      navigate("/", { replace: true });
+    }
+  }, [location.pathname, navigate]);
 
   useEffect(() => {
     let alive = true;
@@ -110,6 +125,7 @@ export default function App() {
           <Route path="/market" element={<Market />} />
           <Route path="/actions" element={<Actions />} />
           <Route path="/history" element={<History />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       )}
 
