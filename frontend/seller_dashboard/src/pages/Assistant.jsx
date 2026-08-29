@@ -11,7 +11,7 @@ import {
   setStickyArticle,
 } from "../api";
 import { parseWbArticle } from "../catalog";
-import { humanizeText } from "../labels";
+import { COPY, humanizeText, isTechLeak } from "../labels";
 
 const SECONDARY = [
   { id: "unit", label: "Юнит-экономика" },
@@ -37,7 +37,7 @@ export default function Assistant() {
         const ctx = await fetchAssistantContext();
         if (!alive) return;
         if (ctx.article) setArticle(String(ctx.article));
-        if (ctx.followups) setFollowups(ctx.followups);
+        if (ctx.followups) setFollowups(humanFollowups(ctx.followups));
       } catch (e) {
         if (alive) setError(String(e.message || e));
       }
@@ -84,8 +84,11 @@ export default function Assistant() {
         setPreview(res);
         if (res.article) setArticle(String(res.article));
       }
-      if (res.followups) setFollowups(res.followups);
-      setLog((prev) => [...prev, { role: "bot", text: humanizeText(res.text || "Нет ответа") }]);
+      if (res.followups) setFollowups(humanFollowups(res.followups));
+      setLog((prev) => [
+        ...prev,
+        { role: "bot", text: assistantReply(res.text, chip) },
+      ]);
     } catch (e) {
       setLog((prev) => [
         ...prev,
@@ -161,7 +164,7 @@ export default function Assistant() {
 
       {preview?.first_screen && (
         <div className="card">
-          <FirstScreen cards={preview.first_screen} />
+          <FirstScreen cards={preview.first_screen} score={preview.argus_score} status={preview.argus_status} />
           {preview.can_add && (
             <button
               type="button"
@@ -209,4 +212,34 @@ export default function Assistant() {
       )}
     </div>
   );
+}
+
+function humanFollowups(list) {
+  return (list || [])
+    .map((f) => ({
+      ...f,
+      label: humanizeText(f.label, f.label),
+    }))
+    .filter((f) => f.label && !isTechLeak(f.label) && !isTechLeak(f.id));
+}
+
+function assistantReply(raw, chip) {
+  const text = humanizeText(raw || "", "");
+  if (chip === "unit" && (!text || isTechLeak(raw))) {
+    return `${COPY.unitMissing}\n${COPY.unitNeedCost}`;
+  }
+  if (chip === "dyn" && (!text || isTechLeak(raw))) {
+    return COPY.dynamicsMissing;
+  }
+  if (chip === "market" && (!text || isTechLeak(raw))) {
+    return "Данные рынка не подтверждены. Медиану рынка не показываем.";
+  }
+  if (!text || isTechLeak(raw)) {
+    const src = String(raw || "").toLowerCase();
+    if (/нет точного термина|knowledge/.test(src)) {
+      return "По этому запросу нет готового определения. ARGUS не выдумывает термины.";
+    }
+    return COPY.problemInsufficient;
+  }
+  return text;
 }

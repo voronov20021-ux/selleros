@@ -36,7 +36,7 @@ export default function RecommendationCard({ title, problems = [], recommendatio
       )}
       {!problems.length && !recommendations.length && (
         <p className="muted" style={{ margin: 0 }}>
-          Замечаний нет
+          Замечаний по доступным данным нет. Если цифр мало — это не «проблем нет».
         </p>
       )}
     </div>

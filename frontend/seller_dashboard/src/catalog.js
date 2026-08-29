@@ -87,18 +87,32 @@ export async function loadSellerStore() {
     }
   }
 
-  const scores = products.map((p) => Number(p.argus_score)).filter((n) => Number.isFinite(n));
+  const scores = products
+    .map((p) => {
+      if (p.argus_score == null || p.argus_score === "") return null;
+      const n = Number(p.argus_score);
+      return Number.isFinite(n) ? n : null;
+    })
+    .filter((n) => n != null);
+  const catalogIndex =
+    catalog && !catalog.demo && catalog.argus_index != null && catalog.argus_index !== ""
+      ? Number(catalog.argus_index)
+      : null;
+  const catalogIndexOk =
+    catalogIndex != null &&
+    Number.isFinite(catalogIndex) &&
+    !(catalogIndex === 0 && scores.every((s) => s !== 0));
   const metrics =
     products.length === 0
       ? null
       : {
-          argus_index:
-            catalog && !catalog.demo && catalog.argus_index != null
-              ? catalog.argus_index
-              : scores.length
-                ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
-                : null,
+          argus_index: scores.length
+            ? catalogIndexOk
+              ? catalogIndex
+              : Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+            : null,
           products_count: products.length,
+          scored_count: scores.length,
           updated_at: catalog?.updated_at || null,
         };
 
@@ -129,7 +143,10 @@ export function normalizeProduct(p) {
     feedback_count: p.feedback_count ?? p.reviews_count ?? null,
     reviews_count: p.reviews_count ?? p.feedback_count ?? null,
     position: p.position ?? null,
-    argus_score: p.argus_score ?? null,
+    argus_score:
+      p.argus_score == null || p.argus_score === "" || !Number.isFinite(Number(p.argus_score))
+        ? null
+        : Number(p.argus_score),
     argus_status: p.argus_status || p.severity || null,
     problems: p.problems || [],
     recommendations: p.recommendations || [],

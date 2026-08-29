@@ -9,7 +9,7 @@ export default function ProductImage({ src, alt = "", className = "" }) {
 
   if (state === "empty" || state === "error") {
     return (
-      <div className={`thumb branded-fallback ${className}`} aria-hidden="true">
+      <div className={`thumb-wrap branded-fallback ${className}`} aria-hidden="true">
         <span>ARGUS</span>
       </div>
     );

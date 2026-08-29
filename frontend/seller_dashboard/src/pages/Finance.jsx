@@ -5,7 +5,7 @@ import { EmptyState, ErrorState, Skeleton } from "../components/ScreenState";
 import { UnitBlock } from "../components/FirstScreen";
 import { fetchFinance, getStickyArticle } from "../api";
 import { loadSellerStore } from "../catalog";
-import { humanFormula } from "../labels";
+import { humanFormula, humanizeText, isTechLeak, presentNumber } from "../labels";
 
 export default function Finance() {
   const [params, setParams] = useSearchParams();
@@ -151,10 +151,10 @@ export default function Finance() {
               <div className="card" key={line.id || line.label}>
                 <strong>{line.label}</strong>
                 <p className="muted" style={{ margin: "4px 0 0" }}>
-                  {line.value != null
-                    ? `${line.value}${line.id === "margin" ? "%" : " ₽"}`
+                      {presentNumber(line.value) != null
+                    ? `${presentNumber(line.value)}${line.id === "margin" ? "%" : " ₽"}`
                     : line.text || "Нет данных"}
-                  {line.status ? ` · ${humanFormula(line.status)}` : ""}
+                  {humanFormula(line.status) ? ` · ${humanFormula(line.status)}` : ""}
                 </p>
               </div>
             ))}
@@ -164,7 +164,8 @@ export default function Finance() {
           <div className="card">
             {tariffs.confirmed ? (
               <p style={{ margin: 0 }}>
-                Комиссия {tariffs.commission ?? "—"} · логистика {tariffs.logistics ?? "—"}
+                Комиссия {presentNumber(tariffs.commission) != null ? tariffs.commission : "Н/Д"} · логистика{" "}
+                {presentNumber(tariffs.logistics) != null ? tariffs.logistics : "Н/Д"}
               </p>
             ) : (
               <p className="muted" style={{ margin: 0 }}>
@@ -175,7 +176,9 @@ export default function Finance() {
         </>
       )}
 
-      {data?.note && <p className="muted">{data.note}</p>}
+      {data?.note && !isTechLeak(data.note) && (
+        <p className="muted">{humanizeText(data.note)}</p>
+      )}
     </div>
   );
 }

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import BackLink from "../components/BackLink";
 import { completeMission, evaluateFormulaLesson, fetchFormulaLesson } from "../api";
 import { EmptyState, ErrorState, Skeleton } from "../components/ScreenState";
-import { humanFormula } from "../labels";
+import { humanFormula, humanizeText, presentNumber } from "../labels";
 
 export default function Lesson() {
   const [lesson, setLesson] = useState(null);
@@ -118,22 +118,28 @@ export default function Lesson() {
           <input value={orders} onChange={(e) => setOrders(e.target.value)} inputMode="numeric" />
         </div>
         <button className="btn" disabled={busy} onClick={onEval}>
-          Посчитать из Formula Authority
+          Посчитать CTR и CVR
         </button>
       </div>
 
       {result && !result.error && (
         <div className="card">
           <p>
-            <strong>CTR</strong> · {humanFormula(result.ctr?.status)}
-            {result.ctr?.value != null ? ` = ${result.ctr.value}` : " — числа нет"}
+            <strong>CTR</strong>
+            {humanFormula(result.ctr?.status) ? ` · ${humanFormula(result.ctr.status)}` : ""}
+            {presentNumber(result.ctr?.value) != null
+              ? ` = ${presentNumber(result.ctr.value)}`
+              : " — числа нет"}
           </p>
-          <p className="muted">{result.explain_ctr}</p>
+          <p className="muted">{humanizeText(result.explain_ctr, "")}</p>
           <p>
-            <strong>CVR</strong> · {humanFormula(result.cvr?.status)}
-            {result.cvr?.value != null ? ` = ${result.cvr.value}` : " — числа нет"}
+            <strong>CVR</strong>
+            {humanFormula(result.cvr?.status) ? ` · ${humanFormula(result.cvr.status)}` : ""}
+            {presentNumber(result.cvr?.value) != null
+              ? ` = ${presentNumber(result.cvr.value)}`
+              : " — числа нет"}
           </p>
-          <p className="muted">{result.explain_cvr}</p>
+          <p className="muted">{humanizeText(result.explain_cvr, "")}</p>
         </div>
       )}
       {result?.error && <div className="card muted">{result.error}</div>}

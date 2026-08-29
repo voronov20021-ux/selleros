@@ -10,13 +10,15 @@ import {
   acceptIdea,
   addCatalogProduct,
   analyzePublic,
+  completeMission,
   deferAction,
   fetchActionHistory,
+  fetchMissions,
   fetchProduct,
   markActionDone,
   setStickyArticle,
 } from "../api";
-import { humanArgus, humanFunnel, humanizeText } from "../labels";
+import { COPY, formatHealth, formatRatingParts, humanArgus, humanFunnel, humanizeText, isTechLeak, presentNumber } from "../labels";
 
 export default function ProductDetail() {
   const { article } = useParams();
@@ -28,6 +30,7 @@ export default function ProductDetail() {
   const [history, setHistory] = useState([]);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [analysisMission, setAnalysisMission] = useState(false);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -63,6 +66,22 @@ export default function ProductDetail() {
   }, [article, preview, loadHistory]);
 
   useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const m = await fetchMissions();
+        const next = m?.next;
+        if (alive) setAnalysisMission(next?.id === "first_analysis" && !m?.all_done);
+      } catch {
+        if (alive) setAnalysisMission(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [article]);
+
+  useEffect(() => {
     reload();
   }, [reload]);
 
@@ -73,6 +92,18 @@ export default function ProductDetail() {
       await acceptIdea(article, idea);
       setMsg("Принято как действие.");
       await loadHistory();
+    } catch (e) {
+      setMsg(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onFinishAnalysis() {
+    setBusy(true);
+    try {
+      await completeMission("first_analysis");
+      setAnalysisMission(false);
     } catch (e) {
       setMsg(String(e.message || e));
     } finally {
@@ -114,6 +145,11 @@ export default function ProductDetail() {
   const details = cards?.details || {};
   const ideas = cards?.do || [];
   const owned = Boolean(data.owned);
+  const rating = formatRatingParts(data.rating, data.feedback_count ?? data.reviews_count);
+  const health = formatHealth(data.argus_score);
+  const reviewCount = presentNumber(data.feedback_count ?? data.reviews_count);
+  const dynRaw = details.dynamic_analytics?.summary || details.dynamic_analytics?.text;
+  const dynText = humanizeText(dynRaw, "");
 
   return (
     <div>
@@ -130,7 +166,7 @@ export default function ProductDetail() {
 
       <div className="card detail-hero">
         <ProductImage src={data.image} alt="" />
-        <div>
+        <div className="product-card-body">
           <h1 className="meta-title" style={{ fontSize: "1.05rem" }}>
             {data.title}
           </h1>
@@ -140,16 +176,21 @@ export default function ProductDetail() {
           </div>
           <div className="meta-line">
             {data.price != null && <span>{data.price} ₽</span>}
-            {data.rating != null && <span>★ {data.rating}</span>}
-            {data.feedback_count != null && <span>{data.feedback_count} отзывов</span>}
+            <span>{rating.rating}</span>
+            <span>{rating.reviews}</span>
           </div>
-          {data.argus_status && (
+          {data.argus_status ? (
             <div className={`badge status-${data.argus_status}`}>
               <span className={`status-dot bg-${data.argus_status}`} />
               {humanArgus(data.argus_status)}
-              {data.argus_score != null ? ` · ${data.argus_score}` : ""}
+              {health.missing ? "" : ` · ${health.value}`}
             </div>
+          ) : (
+            <div className="badge status-YELLOW">Пока недостаточно данных</div>
           )}
+          <p className="muted" style={{ margin: "6px 0 0" }}>
+            {health.text}
+          </p>
         </div>
       </div>
 
@@ -208,35 +249,45 @@ export default function ProductDetail() {
       )}
 
       <h2 className="section-title">Главный экран ARGUS</h2>
-      <FirstScreen cards={cards} />
+      <FirstScreen cards={cards} score={data.argus_score} status={data.argus_status} />
+
+      {analysisMission && cards && (
+        <div className="card" data-mission="first_analysis">
+          <p style={{ marginTop: 0 }}>
+            Это первый разбор ARGUS. Когда просмотрите вывод и цифры — закройте шаг.
+          </p>
+          <button type="button" className="btn" disabled={busy} onClick={onFinishAnalysis}>
+            {COPY.missionDone}
+          </button>
+        </div>
+      )}
 
       <details className="card details-block">
         <summary>Почему ARGUS так решил</summary>
-        {(details.why || []).length ? (
+        {(details.why || []).filter((w) => humanizeText(w) && !isTechLeak(w)).length ? (
           <ul className="fs-list">
-            {details.why.map((w) => (
+            {(details.why || []).filter((w) => humanizeText(w) && !isTechLeak(w)).map((w) => (
               <li key={w}>{humanizeText(w)}</li>
             ))}
           </ul>
         ) : (
           <p className="muted">Короткого объяснения пока нет.</p>
         )}
-        {data.source_label && <p className="muted">{data.source_label}</p>}
       </details>
 
       <details className="card details-block" open>
         <summary>Карточка</summary>
         <p className="muted">
-          {data.title}. Цена {data.price != null ? `${data.price} ₽` : "неизвестна"}, рейтинг{" "}
-          {data.rating != null ? data.rating : "неизвестен"}.
+          {data.title}. Цена {data.price != null ? `${data.price} ₽` : "неизвестна"}. {rating.rating}.{" "}
+          {health.text}.
         </p>
       </details>
 
       <details className="card details-block">
         <summary>Отзывы</summary>
         <p className="muted">
-          {data.feedback_count != null
-            ? `${data.feedback_count} отзывов на карточке.`
+          {reviewCount != null
+            ? `${rating.reviews} на карточке.`
             : "Нет данных по отзывам."}{" "}
           {details.photos_analyzed ? "" : "Детальный разбор фото не делали."}
         </p>
@@ -267,10 +318,10 @@ export default function ProductDetail() {
 
       <details className="card details-block">
         <summary>Динамика</summary>
-        {details.dynamic_analytics?.summary || details.dynamic_analytics?.text ? (
-          <p className="muted">{details.dynamic_analytics.summary || details.dynamic_analytics.text}</p>
+        {dynText ? (
+          <p className="muted">{dynText}</p>
         ) : (
-          <p className="muted">Пока нет подтверждённой динамики по периодам.</p>
+          <p className="muted">{COPY.dynamicsMissing}</p>
         )}
       </details>
 

@@ -218,12 +218,12 @@ export default function Products() {
           <div className="quick-result">
             <div className="detail-hero" style={{ marginTop: 12 }}>
               <ProductImage src={quickResult.image} alt="" />
-              <div>
+              <div className="product-card-body">
                 <strong>{quickResult.title}</strong>
                 <p className="muted">nmID {quickResult.article}</p>
               </div>
             </div>
-            <FirstScreen cards={quickResult.first_screen} />
+            <FirstScreen cards={quickResult.first_screen} score={quickResult.argus_score} status={quickResult.argus_status} />
             {quickResult.can_add && (
               <button
                 type="button"

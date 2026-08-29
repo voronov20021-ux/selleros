@@ -6,7 +6,7 @@ import MissionBar from "../components/MissionBar";
 import { EmptyState, ErrorState, Skeleton } from "../components/ScreenState";
 import { attentionList, improveList, loadSellerStore } from "../catalog";
 import { fetchActionHistory, fetchMissions, getAuthState } from "../api";
-import { formatWhen, humanAction } from "../labels";
+import { COPY, formatWhen, humanAction, inferProblemState } from "../labels";
 
 export default function Dashboard({ displayName }) {
   const [store, setStore] = useState(null);
@@ -58,15 +58,26 @@ export default function Dashboard({ displayName }) {
   const products = store?.products || [];
   const attention = attentionList(products);
   const improve = improveList(products);
-  const emptyHealth = !products.length || store?.metrics?.argus_index == null;
+  const healthScore = store?.metrics?.argus_index;
+  const emptyHealth = !products.length || healthScore == null;
+  const scoredCount = store?.metrics?.scored_count ?? 0;
+  const preliminary = !emptyHealth && scoredCount > 0 && scoredCount < products.length;
   const status =
-    store?.metrics?.argus_index >= 75
+    healthScore >= 75
       ? "GREEN"
-      : store?.metrics?.argus_index >= 50
+      : healthScore >= 50
         ? "YELLOW"
-        : store?.metrics?.argus_index != null
+        : healthScore != null
           ? "RED"
           : null;
+  const firstArticle = products[0]?.article;
+  const attentionState = products.length
+    ? inferProblemState({
+        status: attention.length ? "RED" : products.some((p) => p.argus_status) ? "GREEN" : null,
+        score: healthScore,
+        figures: products.some((p) => (p.first_screen?.figures || []).length) ? [{}] : [],
+      })
+    : "insufficient";
 
   return (
     <div>
@@ -79,14 +90,17 @@ export default function Dashboard({ displayName }) {
 
       <h1 className="greeting">Привет, {name}</h1>
 
-      {missions && !missions.all_done && <MissionBar missions={missions} />}
+      {missions && !missions.all_done && (
+        <MissionBar missions={missions} article={firstArticle} />
+      )}
 
       <div className="card" data-tour="health" data-mission="dashboard_ready">
         <ArgusScore
-          score={emptyHealth ? null : store.metrics.argus_index}
+          score={emptyHealth ? null : healthScore}
           status={status}
           empty={emptyHealth}
           count={products.length}
+          preliminary={preliminary}
         />
       </div>
 
@@ -97,13 +111,21 @@ export default function Dashboard({ displayName }) {
         ))}
         {!attention.length && (
           <EmptyState
-            title="Сейчас ничего критичного"
+            title={
+              !products.length
+                ? "Товаров пока нет"
+                : attentionState === "insufficient"
+                  ? COPY.problemInsufficient
+                  : COPY.problemNotConfirmed
+            }
             text={
               products.length
-                ? "Нет карточек со статусом «критично» или «требует внимания»."
+                ? attentionState === "insufficient"
+                  ? "По статусам карточек пока нельзя судить — нет оценок ARGUS."
+                  : "Нет карточек со статусом «критично» или «требует внимания»."
                 : "Товаров пока нет — нечего подсветить."
             }
-            to={products.length ? "/products" : "/products"}
+            to="/products"
             action={products.length ? "К товарам" : "Добавить товар"}
             to2={products.length ? undefined : "/settings"}
             action2={products.length ? undefined : "Подключить WB позже"}
