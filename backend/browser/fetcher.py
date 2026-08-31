@@ -129,6 +129,7 @@ class PlaywrightBrowserFetcher:
         self.last_redirect_chain: list[str] = []
         self.last_product_page_detected: bool | None = None
         self.last_launch_kind: str | None = None
+        self.last_http_status: int | None = None
 
     def is_available(self) -> bool:
         try:
@@ -148,14 +149,22 @@ class PlaywrightBrowserFetcher:
         self.last_redirect_chain = []
         self.last_product_page_detected = None
         self.last_launch_kind = None
+        self.last_http_status = None
 
     async def fetch(self, article: int) -> tuple[WBProduct, list[Review]]:
+        article = int(article)
+        log.info("Browser fetch started: article=%s", article)
+
         if not self.is_available():
+            log.info(
+                "Browser proxy configured: %s",
+                "yes" if (self.proxy_pool or self.proxy_url) else "no",
+            )
+            log.info("Browser fetch failure")
             raise BrowserFetchError("playwright not installed")
 
         from playwright.async_api import async_playwright
 
-        article = int(article)
         url = build_product_url(article)
         self._reset_nav_diagnostics(url)
         chosen = self._pick_proxy_url()
@@ -167,9 +176,11 @@ class PlaywrightBrowserFetcher:
             session_id=self.session_id,
             session_time=self.session_time,
         )
+        log.info("Browser proxy configured: %s", "yes" if proxy_cfg else "no")
         if chosen and proxy_cfg is None:
             if self.proxy_pool:
                 self.proxy_pool.mark_failed(chosen)
+            log.info("Browser fetch failure")
             raise BrowserFetchError(
                 "Chromium does not support authenticated SOCKS5 proxy"
             )
@@ -235,10 +246,19 @@ class PlaywrightBrowserFetcher:
                             return
 
                     page.on("response", on_response)
+                    log.info("Browser navigation started")
                     resp = await page.goto(
                         url,
                         wait_until="domcontentloaded",
                         timeout=self.timeout_ms,
+                    )
+                    nav_status = getattr(resp, "status", None) if resp is not None else None
+                    self.last_http_status = nav_status if isinstance(nav_status, int) else None
+                    log.info(
+                        "Browser navigation result: HTTP status %s",
+                        self.last_http_status
+                        if self.last_http_status is not None
+                        else "unknown",
                     )
                     if resp is not None and f"{resp.status} {resp.url}" not in redirect_chain:
                         redirect_chain.insert(0, f"{resp.status} {resp.url}")
@@ -293,6 +313,7 @@ class PlaywrightBrowserFetcher:
                         print(msg, flush=True)
                     if self.proxy_pool and chosen:
                         self.proxy_pool.mark_success(chosen)
+                    log.info("Browser fetch success")
                     return product, reviews
                 finally:
                     if cleanup is not None:
@@ -305,6 +326,7 @@ class PlaywrightBrowserFetcher:
         except BrowserFetchError:
             if self.proxy_pool and chosen:
                 self.proxy_pool.mark_failed(chosen)
+            log.info("Browser fetch failure")
             raise
         except Exception as exc:
             if self.proxy_pool and chosen:
@@ -315,6 +337,7 @@ class PlaywrightBrowserFetcher:
                 parsed = parse_proxy_url(chosen)
                 if parsed and parsed.get("password"):
                     msg = msg.replace(parsed["password"], "***")
+            log.info("Browser fetch failure")
             raise BrowserFetchError(msg) from exc
 
     async def _open_system_chrome(

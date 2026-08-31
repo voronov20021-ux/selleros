@@ -376,11 +376,15 @@ class ProductService:
         for _, provider in chain:
 
             if not await provider.is_available():
+                if provider.name == "browser":
+                    log.info("fallback to WB Engine: yes")
                 continue
 
             product = await provider.get_product(article)
 
             if product is None:
+                if provider.name == "browser":
+                    log.info("fallback to WB Engine: yes")
                 continue
 
             # жёстко: провайдер обязан вернуть тот же nm_id
