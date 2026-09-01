@@ -250,6 +250,19 @@ def _snapshot_fields_summary(product: WBProduct) -> str:
         f"rating={getattr(product, 'rating', None)} "
         f"feedbacks={getattr(product, 'feedbacks', None)} "
         f"photos={photos_n} photo_count={photo_count_i}"
+        f"{_diag_fields_suffix(product)}"
+    )
+
+
+def _diag_fields_suffix(product: WBProduct) -> str:
+    diag = getattr(product, "_browser_diag", None)
+    if not isinstance(diag, dict) or not diag:
+        return ""
+    return (
+        f" html_len={diag.get('html_len')} "
+        f"challenge={diag.get('challenge')} "
+        f"had_detail_json={diag.get('had_detail_json')} "
+        f"detail_status={diag.get('detail_status')}"
     )
 
 

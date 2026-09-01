@@ -152,6 +152,10 @@ class PlaywrightBrowserFetcher:
         self.last_product_page_detected: bool | None = None
         self.last_launch_kind: str | None = None
         self.last_http_status: int | None = None
+        self.last_html_len: int | None = None
+        self.last_challenge: bool | None = None
+        self.last_had_detail_json: bool | None = None
+        self.last_detail_http_status: int | None = None
 
     def is_available(self) -> bool:
         try:
@@ -172,6 +176,10 @@ class PlaywrightBrowserFetcher:
         self.last_product_page_detected = None
         self.last_launch_kind = None
         self.last_http_status = None
+        self.last_html_len = None
+        self.last_challenge = None
+        self.last_had_detail_json = None
+        self.last_detail_http_status = None
 
     async def fetch(self, article: int) -> tuple[WBProduct, list[Review]]:
         article = int(article)
@@ -220,6 +228,7 @@ class PlaywrightBrowserFetcher:
             "detail": None,
             "feedbacks": None,
             "feedbacks_url": None,
+            "detail_http_status": None,
         }
         redirect_chain: list[str] = []
         chrome_exe = (
@@ -257,11 +266,15 @@ class PlaywrightBrowserFetcher:
                             req = response.request
                             if req.is_navigation_request():
                                 redirect_chain.append(f"{response.status} {u}")
-                            if response.status != 200:
-                                return
                             if _is_detail_api_url(u):
+                                intercepted["detail_http_status"] = response.status
+                                if response.status != 200:
+                                    return
                                 payload = await response.json()
                                 _remember_detail(intercepted, payload, article)
+                                return
+                            if response.status != 200:
+                                return
                             if "feedbacks" in u and "wb.ru" in u:
                                 intercepted["feedbacks"] = await response.json()
                                 intercepted["feedbacks_url"] = u
@@ -369,6 +382,21 @@ class PlaywrightBrowserFetcher:
                             f"homepage/not product page FINAL_URL={final_url}"
                         )
 
+                    # Title/URL can look like a card while SPA/anti-bot still
+                    # has no price. Wait for ₽ / price node / intercepted JSON.
+                    await _wait_for_price_or_detail(
+                        page, intercepted, self.timeout_ms,
+                    )
+                    try:
+                        title = (await page.title()) or title
+                    except Exception:
+                        pass
+                    final_url = page.url or final_url
+                    self.last_final_url = final_url
+                    diag = await _page_shell_diag(
+                        page, title, self.last_http_status,
+                    )
+
                     dom = await page.evaluate(_DOM_EXTRACT_JS)
                     product = _build_product(article, intercepted, dom)
                     reviews = _build_reviews(article, intercepted, dom, product)
@@ -378,6 +406,28 @@ class PlaywrightBrowserFetcher:
                         raise BrowserFetchError("required product fields missing")
                     product.source = "browser"
                     _sync_imt_root(product)
+                    self.last_html_len = int(diag.get("html_len") or 0)
+                    self.last_challenge = bool(diag.get("challenge"))
+                    self.last_had_detail_json = intercepted.get("detail") is not None
+                    self.last_detail_http_status = intercepted.get(
+                        "detail_http_status"
+                    )
+                    product._browser_diag = {
+                        "html_len": self.last_html_len,
+                        "challenge": self.last_challenge,
+                        "had_detail_json": self.last_had_detail_json,
+                        "detail_status": self.last_detail_http_status,
+                    }
+                    if product.price is None:
+                        msg = format_empty_commercial_warning(
+                            article,
+                            html_len=self.last_html_len,
+                            challenge=self.last_challenge,
+                            had_detail_json=self.last_had_detail_json,
+                            detail_status=self.last_detail_http_status,
+                        )
+                        log.warning("%s", msg)
+                        print(f"WARNING: {msg}", flush=True)
                     if _commercial_debug_enabled():
                         msg = format_commercial_debug(product, requested_nm_id=article)
                         log.info("%s", msg)
@@ -713,18 +763,19 @@ async def _wait_tcp_port(port: int, timeout_s: float = 15) -> None:
 
 
 def _is_detail_api_url(url: str) -> bool:
+    """WB card JSON: card.wb.ru detail/list and same-origin __internal/u-card.
+
+    SPA often hits `/__internal/u-card/cards/v4/list` — that URL has no
+    substring ``detail``, so requiring it dropped the intercept entirely.
+    """
     u = (url or "").lower()
-    if "detail" not in u:
-        return False
-    return any(
-        host in u
-        for host in (
-            "card.wb.ru",
-            "u-card.wb.ru",
-            "catalog.wb.ru",
-            "wildberries.ru/__internal",
-        )
-    )
+    if any(host in u for host in ("card.wb.ru", "u-card.wb.ru")):
+        return "cards/" in u or "detail" in u
+    if "catalog.wb.ru" in u:
+        return "detail" in u
+    if "wildberries.ru/__internal" in u:
+        return "u-card" in u or "/cards/" in u or "detail" in u
+    return False
 
 
 def is_product_url(url: str, article: int) -> bool:
@@ -833,6 +884,71 @@ async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> No
             break
         except Exception:
             continue
+
+
+_DOM_HAS_PRICE_JS = """() => {
+  const sels = [
+    '[class*="priceBlock"]',
+    '[class*="price-block"]',
+    '[class*="product-page"] [class*="price"]',
+    '[class*="price"]'
+  ];
+  for (const sel of sels) {
+    const el = document.querySelector(sel);
+    const t = (el && el.textContent) ? String(el.textContent) : '';
+    if (t.includes('₽')) return true;
+  }
+  const title = String(document.title || '');
+  if (title.includes('₽')) return true;
+  const body = ((document.body && document.body.innerText) || '').slice(0, 8000);
+  return body.includes('₽');
+}"""
+
+
+def _price_wait_ms(timeout_ms: int) -> int:
+    return min(12000, max(4000, int(timeout_ms) // 5))
+
+
+async def _wait_for_price_or_detail(
+    page: Any,
+    intercepted: dict[str, Any],
+    timeout_ms: int,
+) -> None:
+    """Ждём DOM-цену / ₽ или перехваченный detail JSON, затем extract один раз."""
+    if intercepted.get("detail") is not None:
+        return
+    wait_ms = _price_wait_ms(timeout_ms)
+    deadline = time.monotonic() + wait_ms / 1000.0
+    while time.monotonic() < deadline:
+        if intercepted.get("detail") is not None:
+            return
+        try:
+            if await page.evaluate(_DOM_HAS_PRICE_JS):
+                return
+        except Exception:
+            pass
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            break
+        try:
+            await page.wait_for_timeout(min(400, remaining_ms))
+        except Exception:
+            break
+
+
+def format_empty_commercial_warning(
+    article: int,
+    *,
+    html_len: Any,
+    challenge: Any,
+    had_detail_json: bool,
+    detail_status: Any,
+) -> str:
+    return (
+        f"BrowserFetcher: article={int(article)} empty commercial snapshot "
+        f"html_len={html_len} challenge={challenge} "
+        f"had_detail_json={had_detail_json} detail_status={detail_status}"
+    )
 
 
 def _title_looks_unhydrated(title: str) -> bool:
