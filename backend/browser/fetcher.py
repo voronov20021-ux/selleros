@@ -301,6 +301,54 @@ class PlaywrightBrowserFetcher:
                     self.last_final_url = final_url
                     self.last_redirect_chain = list(redirect_chain)
                     product_ok = is_product_page(final_url, title, article)
+                    diag = await _page_shell_diag(page, title, self.last_http_status)
+                    if (not product_ok) or _title_looks_unhydrated(title):
+                        log.warning(
+                            "BrowserFetcher: article=%s page shell "
+                            "status=%s title=%r html_len=%s empty=%s "
+                            "challenge=%s homepage_title=%s FINAL_URL=%s",
+                            article,
+                            diag.get("status"),
+                            diag.get("title"),
+                            diag.get("html_len"),
+                            diag.get("empty"),
+                            diag.get("challenge"),
+                            diag.get("homepage_title"),
+                            final_url,
+                        )
+                    if (
+                        not product_ok
+                        and is_product_url(final_url, article)
+                        and not _looks_error_page(title)
+                    ):
+                        # URL already /catalog/{nm}/detail — title may still be
+                        # empty / storefront / "Loading" while SPA hydrates.
+                        try:
+                            await page.wait_for_timeout(3000)
+                        except Exception:
+                            pass
+                        title = (await page.title()) or ""
+                        final_url = page.url or final_url
+                        self.last_final_url = final_url
+                        product_ok = is_product_page(final_url, title, article)
+                        if (
+                            not product_ok
+                            and is_product_url(final_url, article)
+                            and not _looks_error_page(title)
+                        ):
+                            log.warning(
+                                "BrowserFetcher: article=%s treating product "
+                                "detail URL as product page (title mismatch) "
+                                "status=%s title=%r html_len=%s empty=%s "
+                                "challenge=%s",
+                                article,
+                                self.last_http_status,
+                                (title or "")[:160],
+                                diag.get("html_len"),
+                                diag.get("empty"),
+                                diag.get("challenge"),
+                            )
+                            product_ok = True
                     self.last_product_page_detected = product_ok
 
                     log.info(
@@ -701,15 +749,24 @@ def _normalize_title(text: str) -> str:
 
 
 def _is_homepage_title(title: str) -> bool:
+    """Storefront chrome, not a product title.
+
+    Real card titles often end with «в интернет-магазине Wildberries» —
+    that suffix is not the homepage.
+    """
     t = _normalize_title(title)
     if not t:
         return False
-    markers = (
-        "интернет-магазин wildberries",
-        "широкий ассортимент товаров",
-        "скидки каждый день",
-    )
-    return any(m in t for m in markers)
+    if "широкий ассортимент товаров" in t or "скидки каждый день" in t:
+        return True
+    if t.startswith("интернет-магазин wildberries"):
+        return True
+    if t in ("wildberries", "wildberries.com"):
+        return True
+    # "Wildberries — интернет-магазин" with no product name / «купить»
+    if t.startswith("wildberries") and "интернет-магазин" in t and "купить" not in t:
+        return True
+    return False
 
 
 def _looks_error_page(title: str) -> bool:
@@ -718,21 +775,21 @@ def _looks_error_page(title: str) -> bool:
 
 
 def is_product_page(url: str, title: str, article: int) -> bool:
-    """Карточка товара vs homepage / error shell."""
+    """Карточка товара vs homepage / error shell.
+
+    If the browser already landed on /catalog/{nm}/detail…, the URL is the
+    source of truth. Empty or storefront document.title is common on the SPA
+    shell / anti-bot interstitial — callers extract DOM and fail on missing
+    fields, rather than classifying a product URL as homepage.
+    """
     if not is_product_url(url, article):
         return False
-    if _is_homepage_title(title) or _looks_error_page(title):
+    if _looks_error_page(title):
         return False
     t = _normalize_title(title)
     if t.startswith("loading "):
         return False
-    # document.title карточки обычно содержит nm или «купить»
-    if str(int(article)) in t:
-        return True
-    if "купить" in t or "wildberries" in t:
-        return True
-    # URL верный и title не homepage — считаем product (SPA ещё догружается)
-    return bool(t) and len(t) >= 8
+    return True
 
 
 async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> None:
@@ -746,7 +803,9 @@ async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> No
   const t = title.toLowerCase().replace(/\\u2011/g, '-');
   const urlOk = path.includes('/catalog/{art}/') && path.includes('detail');
   if (!urlOk) return false;
-  if (t.includes('широкий ассортимент') || t.includes('интернет-магазин wildberries'))
+  if (t.includes('широкий ассортимент товаров') || t.includes('скидки каждый день'))
+    return false;
+  if (t.startsWith('интернет-магазин wildberries'))
     return false;
   if (t.includes('что-то не так')) return false;
   if (t.startsWith('loading ')) return false;
@@ -776,6 +835,51 @@ async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> No
             continue
 
 
+def _title_looks_unhydrated(title: str) -> bool:
+    t = _normalize_title(title)
+    if not t or t.startswith("loading "):
+        return True
+    return _is_homepage_title(title)
+
+
+async def _page_shell_diag(page: Any, title: str, status: int | None) -> dict[str, Any]:
+    """HTTP status / title / html size / challenge flags. No proxy secrets."""
+    html_len = 0
+    blob = (title or "").lower()
+    try:
+        info = await page.evaluate(
+            """() => {
+              const html = (document.documentElement && document.documentElement.outerHTML) || '';
+              const text = ((document.body && document.body.innerText) || '').slice(0, 800);
+              return {html_len: html.length, text: text};
+            }"""
+        )
+        if isinstance(info, dict):
+            try:
+                html_len = int(info.get("html_len") or 0)
+            except (TypeError, ValueError):
+                html_len = 0
+            blob = f"{title} {info.get('text') or ''}".lower()
+    except Exception:
+        pass
+    challenge_markers = (
+        "captcha",
+        "challenge",
+        "access denied",
+        "доступ ограничен",
+        "cloudflare",
+        "just a moment",
+    )
+    return {
+        "status": status,
+        "title": (title or "")[:160],
+        "html_len": html_len,
+        "empty": html_len < 500,
+        "challenge": any(m in blob for m in challenge_markers),
+        "homepage_title": _is_homepage_title(title),
+    }
+
+
 def _looks_blocked(title: str, url: str) -> bool:
     blob = f"{title} {url}".lower()
     markers = ("captcha", "access denied", "доступ ограничен", "challenge")
@@ -795,8 +899,12 @@ _DOM_EXTRACT_JS = """
   const norm = (s) => (s || '').toLowerCase().replace(/\\u2011/g, '-');
   const isHomeTitle = (s) => {
     const t = norm(s);
-    return t.includes('интернет-магазин wildberries')
-      || t.includes('широкий ассортимент товаров');
+    if (!t) return false;
+    if (t.includes('широкий ассортимент товаров') || t.includes('скидки каждый день'))
+      return true;
+    if (t.startsWith('интернет-магазин wildberries')) return true;
+    if (t === 'wildberries' || t === 'wildberries.com') return true;
+    return t.startsWith('wildberries') && t.includes('интернет-магазин') && !t.includes('купить');
   };
   const h1 = text('h1');
   const og = meta('og:title');
