@@ -15,6 +15,7 @@ BrowserProvider — PRIORITY №1 источник товара для ProductSe
 from __future__ import annotations
 
 import logging
+import time
 
 from backend.browser.cache import CacheStatus, PublicProductCache
 from backend.browser.fetcher import BrowserFetchError, BrowserFetcherProtocol
@@ -135,6 +136,12 @@ class BrowserProvider(ProductProvider):
             log.info("CACHE MISS → Browser called article=%s", article)
 
         log.info("BrowserProvider: article=%s browser_fetch_start", article)
+        # Amvera/uvicorn часто режет selleros.* INFO — старт виден только так.
+        print(
+            f"WARNING: BrowserProvider: article={article} browser_fetch_start",
+            flush=True,
+        )
+        t0 = time.monotonic()
 
         async def _do_fetch() -> WBProduct | None:
             last_err: Exception | None = None
@@ -162,12 +169,18 @@ class BrowserProvider(ProductProvider):
                         "BrowserProvider: article=%s browser attempt %s/%s failed: %s",
                         article, attempt + 1, self.retries, _safe_err(exc),
                     )
+                    print(
+                        f"WARNING: BrowserProvider: article={article} "
+                        f"attempt {attempt + 1}/{self.retries} failed: {_safe_err(exc)}",
+                        flush=True,
+                    )
             if last_err is not None:
                 raise last_err
             return None
 
         try:
             final_status, product = await self.cache.get_or_fetch(article, _do_fetch)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
             # если ждали чужой in-flight — для логов это HIT после чужого fetch
             if product is not None:
                 if final_status == CacheStatus.HIT and self.last_cache_status != "HIT":
@@ -176,22 +189,46 @@ class BrowserProvider(ProductProvider):
                     self.last_cache_status = "HIT"
                     self.last_browser_status = "SKIPPED_SINGLE_FLIGHT"
                 else:
+                    price = getattr(product, "price", None)
                     log.info("BrowserProvider: article=%s browser=SUCCESS", article)
                     self.last_browser_status = "SUCCESS"
+                    if price in (None, "", [], {}):
+                        # Тихий SUCCESS без цены → дальше Engine 403 + «НЕТ ЦЕН».
+                        # Раньше это было INFO и в Amvera не было видно.
+                        msg = (
+                            f"BrowserProvider: article={article} browser=SUCCESS "
+                            f"but NO PRICE after {elapsed_ms}ms "
+                            f"(title={bool(getattr(product, 'title', None))}) "
+                            f"→ Engine fallback"
+                        )
+                        log.warning("%s", msg)
+                        print(f"WARNING: {msg}", flush=True)
+                    else:
+                        msg = (
+                            f"BrowserProvider: article={article} browser=SUCCESS "
+                            f"price={price} after {elapsed_ms}ms"
+                        )
+                        log.warning("%s", msg)
+                        print(f"WARNING: {msg}", flush=True)
                 _sync_imt_root(product)
                 return product
 
-            log.info(
-                "BrowserProvider: article=%s browser=FAILED → HTTP fallback",
-                article,
+            msg = (
+                f"BrowserProvider: article={article} browser=FAILED "
+                f"after {elapsed_ms}ms → HTTP/Engine fallback"
             )
+            log.warning("%s", msg)
+            print(f"WARNING: {msg}", flush=True)
             self.last_browser_status = "FAILED"
             return None
         except Exception as exc:
-            log.info(
-                "BrowserProvider: article=%s browser=FAILED → HTTP fallback (%s)",
-                article, _safe_err(exc),
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            msg = (
+                f"BrowserProvider: article={article} browser=FAILED "
+                f"after {elapsed_ms}ms → HTTP/Engine fallback ({_safe_err(exc)})"
             )
+            log.warning("%s", msg)
+            print(f"WARNING: {msg}", flush=True)
             self.last_browser_status = "FAILED"
             return None
 
