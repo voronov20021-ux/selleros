@@ -156,6 +156,7 @@ class PlaywrightBrowserFetcher:
         self.last_challenge: bool | None = None
         self.last_had_detail_json: bool | None = None
         self.last_detail_http_status: int | None = None
+        self.last_readiness: dict[str, Any] | None = None
 
     def is_available(self) -> bool:
         try:
@@ -180,6 +181,7 @@ class PlaywrightBrowserFetcher:
         self.last_challenge = None
         self.last_had_detail_json = None
         self.last_detail_http_status = None
+        self.last_readiness = None
 
     async def fetch(self, article: int) -> tuple[WBProduct, list[Review]]:
         article = int(article)
@@ -282,12 +284,14 @@ class PlaywrightBrowserFetcher:
                             return
 
                     page.on("response", on_response)
+                    t_ready0 = time.monotonic()
                     log.info("Browser navigation started")
                     resp = await page.goto(
                         url,
                         wait_until="domcontentloaded",
                         timeout=self.timeout_ms,
                     )
+                    readiness_dom = True
                     nav_status = getattr(resp, "status", None) if resp is not None else None
                     self.last_http_status = nav_status if isinstance(nav_status, int) else None
                     log.info(
@@ -299,15 +303,18 @@ class PlaywrightBrowserFetcher:
                     if resp is not None and f"{resp.status} {resp.url}" not in redirect_chain:
                         redirect_chain.insert(0, f"{resp.status} {resp.url}")
 
-                    await _wait_for_product_page(page, article, self.timeout_ms)
-
                     try:
                         await page.wait_for_load_state(
-                            "networkidle", timeout=min(10000, self.timeout_ms),
+                            "load", timeout=min(5000, self.timeout_ms),
                         )
                     except Exception:
                         pass
-                    await page.wait_for_timeout(800)
+
+                    t_shell0 = time.monotonic()
+                    readiness_shell = await _wait_for_product_page(
+                        page, article, self.timeout_ms,
+                    )
+                    wait_shell_ms = int((time.monotonic() - t_shell0) * 1000)
 
                     final_url = page.url or ""
                     title = (await page.title()) or ""
@@ -336,12 +343,9 @@ class PlaywrightBrowserFetcher:
                     ):
                         # URL already /catalog/{nm}/detail — title may still be
                         # empty / storefront / "Loading" while SPA hydrates.
-                        try:
-                            await page.wait_for_timeout(3000)
-                        except Exception:
-                            pass
-                        title = (await page.title()) or ""
-                        final_url = page.url or final_url
+                        title, final_url = await _poll_hydrated_title(
+                            page, article, final_url, cap_ms=3000,
+                        )
                         self.last_final_url = final_url
                         product_ok = is_product_page(final_url, title, article)
                         if (
@@ -363,6 +367,8 @@ class PlaywrightBrowserFetcher:
                             )
                             product_ok = True
                     self.last_product_page_detected = product_ok
+                    if product_ok:
+                        readiness_shell = True
 
                     log.info(
                         "BrowserFetcher: article=%s FINAL_URL=%s "
@@ -384,9 +390,24 @@ class PlaywrightBrowserFetcher:
 
                     # Title/URL can look like a card while SPA/anti-bot still
                     # has no price. Wait for ₽ / price node / intercepted JSON.
+                    t_comm0 = time.monotonic()
                     await _wait_for_price_or_detail(
                         page, intercepted, self.timeout_ms,
                     )
+                    wait_commercial_ms = int((time.monotonic() - t_comm0) * 1000)
+                    readiness_commercial = intercepted.get("detail") is not None
+                    if not readiness_commercial:
+                        try:
+                            readiness_commercial = bool(
+                                await page.evaluate(_DOM_HAS_PRICE_JS)
+                            )
+                        except Exception:
+                            readiness_commercial = False
+
+                    t_photo0 = time.monotonic()
+                    photo_state = await _wait_for_photos(page, self.timeout_ms)
+                    wait_photos_ms = int((time.monotonic() - t_photo0) * 1000)
+
                     try:
                         title = (await page.title()) or title
                     except Exception:
@@ -398,6 +419,24 @@ class PlaywrightBrowserFetcher:
                     )
 
                     dom = await page.evaluate(_DOM_EXTRACT_JS)
+                    if not isinstance(dom, dict):
+                        dom = {}
+                    merged_candidates: list[Any] = []
+                    merged_candidates.extend(dom.get("photos") or [])
+                    merged_candidates.extend(photo_state.get("candidates") or [])
+                    photos = filter_photo_urls(merged_candidates)
+                    dom["photos"] = photos
+                    img_found = int(
+                        photo_state.get("img_count")
+                        or dom.get("img_count")
+                        or 0
+                    )
+                    sample_attrs = (
+                        photo_state.get("samples")
+                        or dom.get("photo_attr_samples")
+                        or []
+                    )
+
                     product = _build_product(article, intercepted, dom)
                     reviews = _build_reviews(article, intercepted, dom, product)
                     if _is_homepage_title(product.title or ""):
@@ -412,12 +451,52 @@ class PlaywrightBrowserFetcher:
                     self.last_detail_http_status = intercepted.get(
                         "detail_http_status"
                     )
+                    wait_total_ms = int((time.monotonic() - t_ready0) * 1000)
+                    photos_n = len(product.photos or [])
+                    readiness_photos = bool(photos_n)
+                    conditions = {
+                        "domcontentloaded": bool(readiness_dom),
+                        "product_shell": bool(readiness_shell or product_ok),
+                        "commercial": bool(
+                            readiness_commercial or product.price is not None
+                        ),
+                        "photos": readiness_photos,
+                    }
+                    fields = {
+                        "title": bool(product.title),
+                        "price": product.price is not None,
+                        "rating": product.rating is not None,
+                        "reviews": product.feedbacks is not None,
+                        "photos": readiness_photos,
+                    }
+                    self.last_readiness = {
+                        "wait_ms": wait_total_ms,
+                        "wait_shell_ms": wait_shell_ms,
+                        "wait_commercial_ms": wait_commercial_ms,
+                        "wait_photos_ms": wait_photos_ms,
+                        "conditions": conditions,
+                        "fields": fields,
+                        "img_found": img_found,
+                        "photos_extracted": photos_n,
+                    }
                     product._browser_diag = {
                         "html_len": self.last_html_len,
                         "challenge": self.last_challenge,
                         "had_detail_json": self.last_had_detail_json,
                         "detail_status": self.last_detail_http_status,
+                        "readiness": dict(self.last_readiness),
                     }
+                    ready_msg = format_readiness_warning(
+                        article,
+                        wait_ms=wait_total_ms,
+                        conditions=conditions,
+                        img_found=img_found,
+                        photos_extracted=photos_n,
+                        fields=fields,
+                        sample_attrs=sample_attrs if not readiness_photos else None,
+                    )
+                    log.warning("%s", ready_msg)
+                    print(f"WARNING: {ready_msg}", flush=True)
                     if product.price is None:
                         msg = format_empty_commercial_warning(
                             article,
@@ -843,7 +922,7 @@ def is_product_page(url: str, title: str, article: int) -> bool:
     return True
 
 
-async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> None:
+async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> bool:
     """Минимальное ожидание маркеров карточки после goto (SPA)."""
     wait_ms = min(25000, max(5000, int(timeout_ms) // 2))
     art = int(article)
@@ -854,21 +933,19 @@ async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> No
   const t = title.toLowerCase().replace(/\\u2011/g, '-');
   const urlOk = path.includes('/catalog/{art}/') && path.includes('detail');
   if (!urlOk) return false;
-  if (t.includes('широкий ассортимент товаров') || t.includes('скидки каждый день'))
-    return false;
-  if (t.startsWith('интернет-магазин wildberries'))
-    return false;
   if (t.includes('что-то не так')) return false;
   if (t.startsWith('loading ')) return false;
   const hasShell = !!document.querySelector(
-    '[class*="product-page"], [class*="productCard"], [class*="product-detail"]'
+    'h1, [class*="product-page"], [class*="productCard"], [class*="product-detail"], [class*="priceBlock"], [class*="price-block"]'
   );
   const titleOk = title.includes('{art}') || (title.length > 12 && t.includes('купить'));
   return hasShell || titleOk;
 }}
 """
+    ok = False
     try:
         await page.wait_for_function(js, timeout=wait_ms)
+        ok = True
     except Exception:
         # ниже is_product_page / required fields решат fail
         pass
@@ -881,9 +958,11 @@ async def _wait_for_product_page(page: Any, article: int, timeout_ms: int) -> No
     ):
         try:
             await page.wait_for_selector(sel, timeout=1500)
+            ok = True
             break
         except Exception:
             continue
+    return ok
 
 
 _DOM_HAS_PRICE_JS = """() => {
@@ -934,6 +1013,339 @@ async def _wait_for_price_or_detail(
             await page.wait_for_timeout(min(400, remaining_ms))
         except Exception:
             break
+
+
+def _photos_wait_ms(timeout_ms: int) -> int:
+    return min(10000, max(3000, int(timeout_ms) // 6))
+
+
+_PHOTO_HOST_MARKERS = (
+    "wbbasket.ru",
+    "wbcontent",
+    "wbstatic.net",
+    "images.wbstatic",
+    "img.wbstatic",
+)
+_PHOTO_SKIP_MARKERS = (
+    "favicon",
+    "sprite",
+    "placeholder",
+    "data:image",
+    "logo.svg",
+    "/logo/",
+    "blank.gif",
+    "1x1",
+)
+_IMG_ATTR_RE = re.compile(
+    r"(?:src|srcset|data-src|data-srcset|data-lazy-src|data-original|"
+    r"data-zoom-src|data-src-pb|data-img|content)\s*=\s*"
+    r"(?:\"([^\"]*)\"|'([^']*)')",
+    flags=re.IGNORECASE,
+)
+
+
+def split_srcset_urls(value: str) -> list[str]:
+    """Разобрать srcset в список URL (без descriptor 1x/2x/300w)."""
+    out: list[str] = []
+    text = (value or "").replace("\n", " ").strip()
+    if not text:
+        return out
+    for chunk in text.split(","):
+        token = chunk.strip().split()[0] if chunk.strip() else ""
+        if token:
+            out.append(token.strip("'\""))
+    return out
+
+
+def expand_photo_candidates(raw: Any) -> list[str]:
+    items: list[str] = []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return items
+    srcset_hint = re.compile(r"\s+\d+[wx]\b")
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        s = item.strip()
+        if not s or s.lower().startswith("data:"):
+            continue
+        if "," in s and (
+            " http" in s
+            or " 1x" in s
+            or " 2x" in s
+            or srcset_hint.search(s)
+        ):
+            items.extend(split_srcset_urls(s))
+        else:
+            items.append(s.strip("'\""))
+    return items
+
+
+def is_real_photo_url(url: str) -> bool:
+    """Настоящий http(s) URL картинки с страницы. Не basket-CDN из nm."""
+    u = (url or "").strip().strip("'\"")
+    if not u or u.startswith("data:") or u.startswith("blob:"):
+        return False
+    if u.startswith("//"):
+        u = "https:" + u
+    low = u.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        return False
+    if any(s in low for s in _PHOTO_SKIP_MARKERS):
+        return False
+    if any(h in low for h in _PHOTO_HOST_MARKERS):
+        return True
+    if "/images/" in low and (
+        "wildberries" in low or "wb.ru" in low or "wbbasket" in low
+    ):
+        return True
+    if any(
+        p in low
+        for p in ("/images/big/", "/images/c516", "/images/tm/", "/images/huge/")
+    ):
+        return True
+    return False
+
+
+def filter_photo_urls(raw: Any) -> list[str]:
+    """Дедуп реальных photo URL из DOM-атрибутов / srcset. Без fake CDN."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in expand_photo_candidates(raw):
+        if u.startswith("//"):
+            u = "https:" + u
+        if not is_real_photo_url(u) or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+        if len(out) >= 20:
+            break
+    return out
+
+
+def photo_urls_from_html(html: str) -> list[str]:
+    """Достать photo URL из HTML-фрагмента (img/source/og:image атрибуты)."""
+    if not html:
+        return []
+    raw: list[str] = []
+    for m in _IMG_ATTR_RE.finditer(html):
+        raw.append(m.group(1) if m.group(1) is not None else (m.group(2) or ""))
+    return filter_photo_urls(raw)
+
+
+def _summarize_photo_samples(samples: Any, limit: int = 5) -> str:
+    if not isinstance(samples, list) or not samples:
+        return "[]"
+    slim: list[dict[str, str]] = []
+    for item in samples[:limit]:
+        if not isinstance(item, dict):
+            continue
+        slim.append(
+            {str(k): str(v)[:120] for k, v in list(item.items())[:8]}
+        )
+    return repr(slim)
+
+
+def format_readiness_warning(
+    article: int,
+    *,
+    wait_ms: int,
+    conditions: dict[str, bool],
+    img_found: int,
+    photos_extracted: int,
+    fields: dict[str, bool],
+    sample_attrs: Any = None,
+) -> str:
+    done = ",".join(k for k, v in conditions.items() if v) or "none"
+    missing = ",".join(k for k, v in conditions.items() if not v) or "none"
+    found = ",".join(k for k, v in fields.items() if v) or "none"
+    msg = (
+        f"BrowserFetcher: article={int(article)} readiness wait_ms={int(wait_ms)} "
+        f"conditions={done} missing={missing} "
+        f"img_found={int(img_found)} photos_extracted={int(photos_extracted)} "
+        f"fields={found}"
+    )
+    if not conditions.get("photos"):
+        msg += (
+            f" readiness_photos=false sample_attrs="
+            f"{_summarize_photo_samples(sample_attrs)}"
+        )
+    return msg
+
+
+async def _poll_hydrated_title(
+    page: Any,
+    article: int,
+    final_url: str,
+    *,
+    cap_ms: int = 3000,
+) -> tuple[str, str]:
+    """Короткий poll title/h1 вместо sleep(3) на ещё не гидратированной SPA."""
+    deadline = time.monotonic() + max(0, int(cap_ms)) / 1000.0
+    title = ""
+    url = final_url or ""
+    while time.monotonic() < deadline:
+        try:
+            title = (await page.title()) or ""
+        except Exception:
+            title = ""
+        try:
+            url = page.url or url
+        except Exception:
+            pass
+        if is_product_page(url, title, article) and not _title_looks_unhydrated(title):
+            return title, url
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            break
+        try:
+            await page.wait_for_timeout(min(300, remaining_ms))
+        except Exception:
+            break
+    try:
+        title = (await page.title()) or title
+    except Exception:
+        pass
+    try:
+        url = page.url or url
+    except Exception:
+        pass
+    return title, url
+
+
+_PHOTO_PROBE_JS = """
+() => {
+  const ATTR_KEYS = [
+    'src', 'srcset', 'data-src', 'data-srcset', 'data-lazy-src',
+    'data-original', 'data-zoom-src', 'data-src-pb', 'data-img', 'data-image'
+  ];
+  const candidates = [];
+  const samples = [];
+  const imgs = Array.from(document.querySelectorAll('img'));
+  for (const img of imgs) {
+    const sample = {};
+    if (img.currentSrc) candidates.push(img.currentSrc);
+    for (const k of ATTR_KEYS) {
+      const v = img.getAttribute(k);
+      if (v) {
+        if (samples.length < 8) sample[k] = String(v).slice(0, 180);
+        candidates.push(v);
+      }
+    }
+    if (img.dataset) {
+      for (const k of Object.keys(img.dataset)) {
+        const v = img.dataset[k];
+        if (!v) continue;
+        if (/https?:|\\/\\/|\\/images\\/|wbbasket|wbstatic|wbcontent/i.test(String(v))) {
+          if (samples.length < 8) sample['data-' + k] = String(v).slice(0, 180);
+          candidates.push(String(v));
+        }
+      }
+    }
+    if (Object.keys(sample).length && samples.length < 8) samples.push(sample);
+  }
+  for (const el of document.querySelectorAll('source')) {
+    for (const k of ['srcset', 'data-srcset', 'src', 'data-src']) {
+      const v = el.getAttribute(k);
+      if (v) candidates.push(v);
+    }
+  }
+  const og = document.querySelector(
+    'meta[property="og:image"], meta[property="og:image:url"], meta[name="og:image"]'
+  );
+  if (og) {
+    const c = og.getAttribute('content');
+    if (c) candidates.push(c);
+  }
+  const bgNodes = document.querySelectorAll(
+    '[class*="photo"], [class*="slide"], [class*="gallery"], [style*="background"]'
+  );
+  const bgLimit = Math.min(bgNodes.length, 24);
+  for (let i = 0; i < bgLimit; i++) {
+    const el = bgNodes[i];
+    let bg = '';
+    try {
+      bg = (el.getAttribute('style') || '') + ' ' +
+        ((el.style && el.style.backgroundImage) || '');
+    } catch (e) {}
+    const re = /url\\((['"]?)([^'")]+)\\1\\)/g;
+    let m;
+    while ((m = re.exec(bg))) candidates.push(m[2]);
+  }
+  return { img_count: imgs.length, candidates, samples };
+}
+"""
+
+
+_GALLERY_NUDGE_JS = """
+() => {
+  const sel = [
+    '[class*="photo-zoom"]',
+    '[class*="photoZoom"]',
+    '[class*="product-page__slide"]',
+    '[class*="swiper-wrapper"]',
+    '[class*="gallery"]',
+    '[class*="j-photo"]',
+    'img[src*="wbbasket"]',
+    'img[data-src*="wbbasket"]',
+    'img[srcset*="wbbasket"]',
+    'h1'
+  ].join(',');
+  const el = document.querySelector(sel);
+  if (el) {
+    try { el.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (e) {}
+  }
+  try {
+    window.scrollTo(0, Math.min(480, Math.max(160, (window.innerHeight || 600) * 0.35)));
+  } catch (e) {}
+  try { window.dispatchEvent(new Event('scroll')); } catch (e) {}
+  const imgs = Array.from(document.querySelectorAll('img')).slice(0, 6);
+  for (const img of imgs) {
+    try { img.scrollIntoView({block: 'nearest'}); } catch (e) {}
+  }
+  return true;
+}
+"""
+
+
+async def _wait_for_photos(page: Any, timeout_ms: int) -> dict[str, Any]:
+    """Poll DOM на реальные photo URL; gallery scroll 1–2 раза. Cap = timeout."""
+    wait_ms = _photos_wait_ms(timeout_ms)
+    deadline = time.monotonic() + wait_ms / 1000.0
+    last: dict[str, Any] = {"img_count": 0, "candidates": [], "samples": []}
+    nudges = 0
+    t0 = time.monotonic()
+    while True:
+        try:
+            probe = await page.evaluate(_PHOTO_PROBE_JS)
+            if isinstance(probe, dict):
+                last = probe
+        except Exception:
+            pass
+        urls = filter_photo_urls(last.get("candidates") or [])
+        last["photos"] = urls
+        last["wait_ms"] = int((time.monotonic() - t0) * 1000)
+        last["readiness_photos"] = bool(urls)
+        if urls:
+            return last
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            break
+        if nudges < 2:
+            try:
+                await page.evaluate(_GALLERY_NUDGE_JS)
+            except Exception:
+                pass
+            nudges += 1
+        try:
+            await page.wait_for_timeout(min(350, remaining_ms))
+        except Exception:
+            break
+    last["wait_ms"] = int((time.monotonic() - t0) * 1000)
+    last["readiness_photos"] = False
+    last["photos"] = filter_photo_urls(last.get("candidates") or [])
+    return last
 
 
 def format_empty_commercial_warning(
@@ -1032,10 +1444,39 @@ _DOM_EXTRACT_JS = """
       break;
     }
   }
-  const imgs = Array.from(document.querySelectorAll('img'))
-    .map(i => i.src)
-    .filter(s => s && (s.includes('wbbasket') || s.includes('wbcontent') || s.includes('/images/')))
-    .slice(0, 20);
+  const imgAttrKeys = [
+    'src', 'srcset', 'data-src', 'data-srcset', 'data-lazy-src',
+    'data-original', 'data-zoom-src', 'data-src-pb', 'data-img'
+  ];
+  const imgCandidates = [];
+  const imgSamples = [];
+  const imgNodes = Array.from(document.querySelectorAll('img'));
+  for (const i of imgNodes) {
+    const sample = {};
+    if (i.currentSrc) imgCandidates.push(i.currentSrc);
+    for (const k of imgAttrKeys) {
+      const v = i.getAttribute(k);
+      if (v) {
+        imgCandidates.push(v);
+        if (imgSamples.length < 8) sample[k] = String(v).slice(0, 160);
+      }
+    }
+    if (Object.keys(sample).length && imgSamples.length < 8) imgSamples.push(sample);
+  }
+  for (const s of Array.from(document.querySelectorAll('source'))) {
+    for (const k of ['srcset', 'data-srcset', 'src', 'data-src']) {
+      const v = s.getAttribute(k);
+      if (v) imgCandidates.push(v);
+    }
+  }
+  const ogImage = document.querySelector(
+    'meta[property="og:image"], meta[property="og:image:url"]'
+  );
+  if (ogImage) {
+    const c = ogImage.getAttribute('content');
+    if (c) imgCandidates.push(c);
+  }
+  const imgs = imgCandidates.slice(0, 80);
   const reviewNodes = Array.from(document.querySelectorAll(
     '[class*="feedback"], [class*="comment"], [data-link*="feedback"]'
   )).slice(0, 60);
@@ -1080,6 +1521,8 @@ _DOM_EXTRACT_JS = """
     rating_text,
     review_line,
     photos: imgs,
+    img_count: imgNodes.length,
+    photo_attr_samples: imgSamples,
     review_texts: reviews,
     characteristics: chars,
     next_data: next,
@@ -1191,10 +1634,10 @@ def _build_product(
                 product, "description", (desc or "")[:80],
                 "browser.dom", nm_id=article, verified=False, scope="nm",
             )
-    photos = dom.get("photos") or []
-    if isinstance(photos, list) and photos:
-        # DOM imgs — только URL-список; photo_count НЕ из len(imgs[:20])
-        product.photos = [p for p in photos if isinstance(p, str)][:20]
+    photos = filter_photo_urls(dom.get("photos") or [])
+    if photos:
+        # DOM imgs — только реальные URL со страницы; photo_count НЕ из len(imgs)
+        product.photos = photos[:20]
     chars = dom.get("characteristics")
     if isinstance(chars, dict) and chars and not product.characteristics:
         product.characteristics = {
