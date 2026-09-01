@@ -190,23 +190,25 @@ class BrowserProvider(ProductProvider):
                     self.last_browser_status = "SKIPPED_SINGLE_FLIGHT"
                 else:
                     price = getattr(product, "price", None)
+                    fields = _snapshot_fields_summary(product)
                     log.info("BrowserProvider: article=%s browser=SUCCESS", article)
                     self.last_browser_status = "SUCCESS"
                     if price in (None, "", [], {}):
                         # Тихий SUCCESS без цены → дальше Engine 403 + «НЕТ ЦЕН».
                         # Раньше это было INFO и в Amvera не было видно.
+                        # fields=… — чтобы следующий Amvera paste показал
+                        # что именно вытащил browser (rating/feedbacks/photos).
                         msg = (
                             f"BrowserProvider: article={article} browser=SUCCESS "
                             f"but NO PRICE after {elapsed_ms}ms "
-                            f"(title={bool(getattr(product, 'title', None))}) "
-                            f"→ Engine fallback"
+                            f"({fields}) → Engine fallback"
                         )
                         log.warning("%s", msg)
                         print(f"WARNING: {msg}", flush=True)
                     else:
                         msg = (
                             f"BrowserProvider: article={article} browser=SUCCESS "
-                            f"price={price} after {elapsed_ms}ms"
+                            f"after {elapsed_ms}ms ({fields})"
                         )
                         log.warning("%s", msg)
                         print(f"WARNING: {msg}", flush=True)
@@ -231,6 +233,24 @@ class BrowserProvider(ProductProvider):
             print(f"WARNING: {msg}", flush=True)
             self.last_browser_status = "FAILED"
             return None
+
+
+def _snapshot_fields_summary(product: WBProduct) -> str:
+    """Короткий дамп полей для Amvera WARNING (без секретов)."""
+    photos = getattr(product, "photos", None) or []
+    photos_n = len(photos) if isinstance(photos, list) else 0
+    photo_count = getattr(product, "photo_count", None)
+    try:
+        photo_count_i = int(photo_count) if photo_count is not None else 0
+    except (TypeError, ValueError):
+        photo_count_i = 0
+    return (
+        f"title={bool(getattr(product, 'title', None))} "
+        f"price={getattr(product, 'price', None)} "
+        f"rating={getattr(product, 'rating', None)} "
+        f"feedbacks={getattr(product, 'feedbacks', None)} "
+        f"photos={photos_n} photo_count={photo_count_i}"
+    )
 
 
 def _safe_err(exc: BaseException) -> str:
