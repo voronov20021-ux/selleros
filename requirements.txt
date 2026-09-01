@@ -24,7 +24,12 @@ curl_cffi
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 httpx>=0.27.0
-# Optional BrowserProvider (Chromium):
-#   pip install playwright && playwright install chromium
-# playwright>=1.40.0
+# BrowserProvider: Python package only. Chromium binaries are a separate step.
+# Local:  python -m playwright install chromium
+# Amvera Python-pip: pip installs this file at BUILD; browsers are NOT downloaded.
+#   At START (same container, before uvicorn/bot): sh scripts/install_playwright.sh
+#   Cache binaries on persistent disk: PLAYWRIGHT_BROWSERS_PATH=/data/ms-playwright
+#   Debian libs (if Chromium crashes on missing .so): python -m playwright install-deps chromium
+#   (~200–400 MB; first start is slow. Do not put browsers under /data if installing at Docker BUILD.)
+playwright>=1.40.0
 

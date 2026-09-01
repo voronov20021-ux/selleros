@@ -117,8 +117,16 @@ def _build_product_service():
         product_service.set_public_cache(cache)
         product_service.register(browser, priority=1)
         log.info("Onboarding ProductService: BrowserProvider priority=1")
+        # print(): uvicorn often hides selleros.* INFO; Amvera logs show stdout.
+        print(
+            "   BrowserProvider: ON "
+            f"(playwright={fetcher.is_available()}, "
+            f"enabled={config.BROWSER_ENABLED}, "
+            f"system_chrome={config.BROWSER_USE_SYSTEM_CHROME})"
+        )
     except Exception as exc:
         log.info("BrowserProvider skip for API: %s", exc)
+        print(f"   BrowserProvider: SKIP for API ({type(exc).__name__})")
 
     try:
         from backend.providers.wb_browser_provider import WBBrowserProvider
