@@ -28,6 +28,8 @@ if ! "$PY" -c "import playwright" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Both Chrome for Testing (chromium-NNNN) and chrome-headless-shell are downloaded.
+# Runtime prefers full chromium via channel=chromium; do not pass --only-shell.
 "$PY" -m playwright install chromium
 echo "install_playwright: chromium ok"
 
@@ -39,4 +41,6 @@ if [ "${PLAYWRIGHT_INSTALL_DEPS:-0}" = "1" ]; then
   else
     echo "install_playwright: install-deps failed (no apt/root?). Set PLAYWRIGHT_INSTALL_DEPS=0 or use a Dockerfile."
   fi
+else
+  echo "install_playwright: skip install-deps (set PLAYWRIGHT_INSTALL_DEPS=1 if Chromium crashes on missing libnss3/libatk/libgbm)"
 fi

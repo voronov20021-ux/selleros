@@ -14,6 +14,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Protocol
@@ -22,6 +23,7 @@ from urllib.parse import urlsplit
 from backend.browser.proxy import (
     generate_playwright_proxy,
     parse_proxy_url,
+    playwright_launch_args,
     redact_proxy_url,
 )
 from backend.browser.system_chrome import (
@@ -38,6 +40,26 @@ log = logging.getLogger("selleros.browser.fetcher")
 
 WB_ORIGIN = "https://www.wildberries.ru"
 WALLET_DISCOUNT = 0.02
+
+# Docker/Amvera: sandbox + tiny /dev/shm crash Chromium at launch.
+_LINUX_CONTAINER_CHROMIUM_ARGS = (
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+)
+
+_CHANNEL_RETRY_MARKERS = (
+    "invalid channel",
+    "unknown channel",
+    "unsupported channel",
+    'channel "chromium"',
+    "channel 'chromium'",
+    "browser to launch is not installed",
+    "executable doesn't exist",
+    "executable not found",
+    "chromium revision is not downloaded",
+    "looks like playwright was just installed",
+)
 
 
 def _commercial_debug_enabled() -> bool:
@@ -220,7 +242,8 @@ class PlaywrightBrowserFetcher:
                     self.last_launch_kind = "system_chrome"
                 else:
                     browser, page = await self._open_playwright_chromium(p, proxy_cfg)
-                    self.last_launch_kind = "playwright_chromium"
+                    if not self.last_launch_kind:
+                        self.last_launch_kind = "playwright_chromium"
                 log.info(
                     "BrowserFetcher: article=%s launch=%s chrome=%s",
                     article,
@@ -395,16 +418,49 @@ class PlaywrightBrowserFetcher:
         p: Any,
         proxy_cfg: dict | None,
     ) -> tuple[Any, Any]:
-        """Legacy bundled Chromium (WB 498). Kept as fallback if Chrome missing."""
-        launch_kwargs: dict[str, Any] = {
-            "headless": self.headless,
-            "args": ["--disable-http2"] if self.disable_http2 else [],
-        }
-        if proxy_cfg:
-            launch_kwargs["proxy"] = proxy_cfg
-        if not launch_kwargs["args"]:
-            launch_kwargs.pop("args", None)
-        browser = await p.chromium.launch(**launch_kwargs)
+        """Bundled Chromium fallback if system Chrome is missing.
+
+        Linux: full Chrome for Testing (`channel=chromium`), not chrome-headless-shell,
+        plus container args (--no-sandbox, --disable-dev-shm-usage, --disable-gpu).
+        Windows path is unchanged (no channel / no Linux flags).
+        """
+        launch_kwargs = build_playwright_chromium_launch_kwargs(
+            headless=self.headless,
+            disable_http2=self.disable_http2,
+            proxy_cfg=proxy_cfg,
+        )
+        log.info(
+            "BrowserFetcher: playwright launch %s",
+            _launch_kwargs_for_log(launch_kwargs),
+        )
+        used_kwargs = launch_kwargs
+        try:
+            browser = await p.chromium.launch(**launch_kwargs)
+        except Exception as exc:
+            log_chromium_launch_failure(exc, launch_kwargs)
+            retry = launch_kwargs_without_channel(launch_kwargs)
+            if retry is not None and should_retry_chromium_launch_without_channel(exc):
+                log.warning(
+                    "BrowserFetcher: retry chromium.launch without channel=%s",
+                    launch_kwargs.get("channel"),
+                )
+                print(
+                    "WARNING: BrowserFetcher: retry chromium.launch without channel",
+                    flush=True,
+                )
+                try:
+                    browser = await p.chromium.launch(**retry)
+                except Exception as exc2:
+                    log_chromium_launch_failure(exc2, retry)
+                    raise
+                used_kwargs = retry
+            else:
+                raise
+        self.last_launch_kind = (
+            "playwright_chromium_full"
+            if used_kwargs.get("channel") == "chromium"
+            else "playwright_chromium"
+        )
         context = await browser.new_context(
             locale="ru-RU",
             user_agent=(
@@ -415,6 +471,185 @@ class PlaywrightBrowserFetcher:
         )
         page = await context.new_page()
         return browser, page
+
+
+def playwright_pkg_version() -> str:
+    try:
+        import playwright
+
+        return str(getattr(playwright, "__version__", "") or "")
+    except Exception:
+        return ""
+
+
+def playwright_version_tuple(raw: str | None = None) -> tuple[int, int]:
+    text = (raw if raw is not None else playwright_pkg_version()) or ""
+    nums: list[int] = []
+    for part in re.split(r"\D+", text.strip()):
+        if part.isdigit():
+            nums.append(int(part))
+        if len(nums) >= 2:
+            break
+    while len(nums) < 2:
+        nums.append(0)
+    return nums[0], nums[1]
+
+
+def playwright_supports_chromium_channel(version: str | None = None) -> bool:
+    """Playwright 1.49+ : channel='chromium' = full Chrome, not headless-shell."""
+    major, minor = playwright_version_tuple(version)
+    return (major, minor) >= (1, 49)
+
+
+def build_playwright_chromium_launch_kwargs(
+    *,
+    headless: bool,
+    disable_http2: bool,
+    proxy_cfg: dict | None = None,
+    platform: str | None = None,
+    playwright_version: str | None = None,
+) -> dict[str, Any]:
+    """Launch kwargs for bundled Playwright Chromium (not system Chrome / CDP).
+
+    Linux containers: full Chromium + sandbox/shm flags. Windows unchanged.
+    """
+    plat = (platform or sys.platform or "").lower()
+    is_linux = plat.startswith("linux")
+    args = list(playwright_launch_args(disable_http2=disable_http2))
+    if is_linux:
+        for flag in _LINUX_CONTAINER_CHROMIUM_ARGS:
+            if flag not in args:
+                args.append(flag)
+    kwargs: dict[str, Any] = {"headless": bool(headless)}
+    if args:
+        kwargs["args"] = args
+    if is_linux:
+        kwargs["chromium_sandbox"] = False
+        if headless and playwright_supports_chromium_channel(playwright_version):
+            kwargs["channel"] = "chromium"
+    if proxy_cfg:
+        kwargs["proxy"] = proxy_cfg
+    return kwargs
+
+
+def should_retry_chromium_launch_without_channel(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CHANNEL_RETRY_MARKERS)
+
+
+def launch_kwargs_without_channel(
+    launch_kwargs: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not launch_kwargs.get("channel"):
+        return None
+    retry = dict(launch_kwargs)
+    retry.pop("channel", None)
+    return retry
+
+
+def _launch_kwargs_for_log(launch_kwargs: dict[str, Any]) -> str:
+    return (
+        f"headless={launch_kwargs.get('headless')} "
+        f"channel={launch_kwargs.get('channel') or 'default'} "
+        f"chromium_sandbox={launch_kwargs.get('chromium_sandbox', 'default')} "
+        f"args={launch_kwargs.get('args') or []} "
+        f"proxy={'yes' if launch_kwargs.get('proxy') else 'no'}"
+    )
+
+
+def _redact_proxy_in_text(text: str, proxy_cfg: dict | None) -> str:
+    if not text or not proxy_cfg:
+        return text
+    out = text
+    pwd = proxy_cfg.get("password")
+    if pwd:
+        out = out.replace(str(pwd), "***")
+    user = proxy_cfg.get("username")
+    if user and len(str(user)) >= 3:
+        out = out.replace(str(user), "***")
+    return out
+
+
+def diagnose_chromium_launch_error(exc_text: str) -> str:
+    """Hints for Amvera logs when chromium.launch dies immediately."""
+    text = exc_text or ""
+    low = text.lower()
+    hints: list[str] = []
+    if "headless-shell" in low or "headless_shell" in low:
+        hints.append("binary=chrome-headless-shell")
+    libs = re.findall(r"lib[\w.+-]+\.so[\w.]*", text)
+    if libs:
+        uniq = list(dict.fromkeys(libs))
+        hints.append("missing libs in error: " + ", ".join(uniq[:12]))
+    ldd_missing = _ldd_not_found_from_launch_log(text)
+    if ldd_missing:
+        hints.append("ldd not found: " + "; ".join(ldd_missing[:12]))
+    if (
+        ldd_missing
+        or libs
+        or "shared librar" in low
+        or "cannot open shared object" in low
+        or "error while loading shared libraries" in low
+    ):
+        hints.append("set PLAYWRIGHT_INSTALL_DEPS=1 and redeploy")
+    if (
+        "target page" in low
+        or "browser has been closed" in low
+        or "has been closed" in low
+    ):
+        hints.append("process died at launch (sandbox/shm/missing libs)")
+    return " | ".join(hints)
+
+
+def _ldd_not_found_from_launch_log(exc_text: str) -> list[str]:
+    if not sys.platform.startswith("linux"):
+        return []
+    match = re.search(r"<launching>\s+(\S+)", exc_text or "")
+    if not match:
+        return []
+    exe = match.group(1)
+    if not os.path.isabs(exe) or not os.path.isfile(exe):
+        return []
+    try:
+        proc = subprocess.run(
+            ["ldd", exe],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return []
+    missing: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        if "not found" in line.lower():
+            missing.append(" ".join(line.split()))
+    return missing
+
+
+def log_chromium_launch_failure(
+    exc: BaseException,
+    launch_kwargs: dict[str, Any],
+) -> None:
+    proxy_cfg = (
+        launch_kwargs.get("proxy")
+        if isinstance(launch_kwargs.get("proxy"), dict)
+        else None
+    )
+    raw = _redact_proxy_in_text(str(exc), proxy_cfg)
+    diagnosis = diagnose_chromium_launch_error(raw)
+    log.warning(
+        "BrowserFetcher: chromium.launch failed (%s): %s",
+        _launch_kwargs_for_log(launch_kwargs),
+        raw[:8000],
+    )
+    print(
+        f"WARNING: BrowserFetcher: chromium.launch failed: {raw[:4000]}",
+        flush=True,
+    )
+    if diagnosis:
+        log.warning("BrowserFetcher: launch diagnosis: %s", diagnosis)
+        print(f"WARNING: BrowserFetcher: {diagnosis}", flush=True)
 
 
 async def _wait_tcp_port(port: int, timeout_s: float = 15) -> None:
